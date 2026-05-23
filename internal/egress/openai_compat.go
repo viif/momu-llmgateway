@@ -58,5 +58,5 @@ func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest)
 }
 
 func (p *OpenAICompatible) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
-	return nil, model.NewError(model.ErrCodeProviderError, "openai compat streaming adapter not wired yet")
+	return StreamOpenAICompatible(ctx, p.client, p.baseURL+"/chat/completions", p.apiKey, req)
 }
