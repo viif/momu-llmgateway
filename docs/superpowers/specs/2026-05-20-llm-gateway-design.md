@@ -211,6 +211,27 @@ type Provider interface {
 
 **Anthropic 适配器**: 将 StandardRequest 转为 Anthropic Messages API 格式（system 提取为顶层字段，流式响应用独立的 `event:` / `data:` 双行 SSE 解析）。
 
+### Provider 注册表
+
+```go
+type Registry struct {
+    mu        sync.RWMutex
+    providers []model.Provider
+    byName    map[string]model.Provider
+    byModel   map[string][]model.Provider
+}
+```
+
+注册表采用**切片 + 双 map + RWMutex** 设计：
+
+- `providers` 切片保留供 `Providers()` 一次性返回全量 Provider 列表
+- `byName` map 提供 O(1) 按 Provider 名称查找
+- `byModel` map 提供 O(1) 按模型名称查找该模型的所有可用 Provider
+- `sync.RWMutex` 保证并发安全：`Register` 持有写锁，所有读方法持有读锁
+- 所有返回集合的读方法均返回防御性拷贝，外部修改不影响内部状态
+
+接口：`Register`、`Providers`、`ProvidersForModel`、`ProviderByName`
+
 ### SSE 流式处理
 
 - `bufio.Scanner` 逐行读取上游 SSE 响应

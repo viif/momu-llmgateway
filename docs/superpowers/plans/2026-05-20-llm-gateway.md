@@ -22,7 +22,7 @@
 - `internal/observability/tracing.go`：RequestID 注入与上下文传递。
 - `internal/egress/openai.go`：OpenAI 兼容 Provider 基类（含 SSE 流式处理），复用给 OpenAI、DeepSeek、Qwen、GLM。
 - `internal/egress/anthropic.go`：Anthropic Messages API 适配器（含独立 SSE 解析）。
-- `internal/egress/adapter.go`：Provider 注册表与按模型查找。
+- `internal/egress/adapter.go`：Provider 注册表（切片 + 双 map + RWMutex，O(1) 查找）。
 - `internal/decision/circuitbreaker.go`：Provider+Model 维度的 Closed/Open/Half-Open 熔断器。
 - `internal/decision/balancer.go`：同模型多 Provider 的加权负载均衡。
 - `internal/decision/strategy_capability.go`：按 task_type 和 token 长度的能力路由。
@@ -1421,7 +1421,7 @@ git commit -m "feat: 添加 anthropic 流式适配"
 - 新建： `internal/egress/adapter.go`
 - 新建： `internal/egress/adapter_test.go`
 
-- [ ] **步骤 1：先写注册表测试**
+- [x] **步骤 1：先写注册表测试**
 
 文件： `internal/egress/adapter_test.go`
 
@@ -1430,17 +1430,26 @@ package egress
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	"github.com/viif/momu-llmgateway/internal/model"
 )
 
-type fakeProvider struct { name string; models []string }
-func (f fakeProvider) Name() string { return f.name }
+type fakeProvider struct {
+	name   string
+	models []string
+}
+
+func (f fakeProvider) Name() string     { return f.name }
 func (f fakeProvider) Models() []string { return f.models }
-func (f fakeProvider) Send(context.Context, *model.StandardRequest) (*model.StandardResponse, error) { return nil, nil }
-func (f fakeProvider) SendStream(context.Context, *model.StandardRequest) (<-chan model.StreamChunk, error) { return nil, nil }
+func (f fakeProvider) Send(context.Context, *model.StandardRequest) (*model.StandardResponse, error) {
+	return nil, nil
+}
+func (f fakeProvider) SendStream(context.Context, *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	return nil, nil
+}
 
 func TestRegistryFindsProvidersByModel(t *testing.T) {
 	r := NewRegistry()
@@ -1449,56 +1458,139 @@ func TestRegistryFindsProvidersByModel(t *testing.T) {
 	require.Len(t, providers, 1)
 	require.Equal(t, "openai", providers[0].Name())
 }
+
+func TestRegistryProviderByName(t *testing.T) {
+	r := NewRegistry()
+	r.Register(fakeProvider{name: "openai", models: []string{"gpt-4o"}})
+	require.NotNil(t, r.ProviderByName("openai"))
+	require.Nil(t, r.ProviderByName("nonexistent"))
+}
+
+func TestRegistryProvidersReturnsCopy(t *testing.T) {
+	r := NewRegistry()
+	r.Register(fakeProvider{name: "openai", models: []string{"gpt-4o"}})
+	list := r.Providers()
+	require.Len(t, list, 1)
+	list[0] = nil
+	require.NotNil(t, r.Providers()[0])
+}
+
+func TestRegistryProvidersForModelNotFound(t *testing.T) {
+	r := NewRegistry()
+	require.Empty(t, r.ProvidersForModel("nonexistent"))
+}
+
+func TestRegistryMultipleProvidersSameModel(t *testing.T) {
+	r := NewRegistry()
+	r.Register(fakeProvider{name: "openai", models: []string{"gpt-4o", "gpt-4o-mini"}})
+	r.Register(fakeProvider{name: "deepseek", models: []string{"gpt-4o", "deepseek-chat"}})
+	require.Len(t, r.ProvidersForModel("gpt-4o"), 2)
+}
+
+func TestRegistryConcurrentAccess(t *testing.T) {
+	r := NewRegistry()
+	r.Register(fakeProvider{name: "openai", models: []string{"gpt-4o"}})
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = r.ProvidersForModel("gpt-4o")
+			_ = r.ProviderByName("openai")
+			_ = r.Providers()
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			r.Register(fakeProvider{name: "extra", models: []string{"extra-model"}})
+		}
+	}()
+	wg.Wait()
+}
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```bash
-go test ./internal/egress -run TestRegistryFindsProvidersByModel -v
+go test -race ./internal/egress -run TestRegistry -v
 ```
 
-预期：失败，提示 `NewRegistry` 未定义。
+预期：`TestRegistryConcurrentAccess` 因 data race 失败。
 
-- [ ] **步骤 3：实现注册表**
+- [x] **步骤 3：实现注册表（切片 + 双 map + RWMutex）**
 
 文件： `internal/egress/adapter.go`
 
 ```go
 package egress
 
-import "github.com/viif/momu-llmgateway/internal/model"
+import (
+	"sync"
 
-type Registry struct { providers []model.Provider }
+	"github.com/viif/momu-llmgateway/internal/model"
+)
 
-func NewRegistry() *Registry { return &Registry{} }
+type Registry struct {
+	mu        sync.RWMutex
+	providers []model.Provider
+	byName    map[string]model.Provider
+	byModel   map[string][]model.Provider
+}
 
-func (r *Registry) Register(p model.Provider) { r.providers = append(r.providers, p) }
+func NewRegistry() *Registry {
+	return &Registry{
+		byName:  make(map[string]model.Provider),
+		byModel: make(map[string][]model.Provider),
+	}
+}
 
-func (r *Registry) Providers() []model.Provider { return append([]model.Provider(nil), r.providers...) }
+func (r *Registry) Register(p model.Provider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.providers = append(r.providers, p)
+	r.byName[p.Name()] = p
+	for _, m := range p.Models() {
+		r.byModel[m] = append(r.byModel[m], p)
+	}
+}
+
+func (r *Registry) Providers() []model.Provider {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]model.Provider, len(r.providers))
+	copy(out, r.providers)
+	return out
+}
 
 func (r *Registry) ProvidersForModel(modelID string) []model.Provider {
-	var out []model.Provider
-	for _, p := range r.providers {
-		for _, m := range p.Models() { if m == modelID { out = append(out, p); break } }
-	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	providers := r.byModel[modelID]
+	out := make([]model.Provider, len(providers))
+	copy(out, providers)
 	return out
 }
 
 func (r *Registry) ProviderByName(name string) model.Provider {
-	for _, p := range r.providers { if p.Name() == name { return p } }
-	return nil
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.byName[name]
 }
 ```
 
-- [ ] **步骤 4：验证测试通过**
+> **设计说明：** `providers` 切片保留供 `Providers()` 返回全量列表；`byName` map 提供 O(1) 按名称查找；`byModel` map 提供 O(1) 按模型查找。`sync.RWMutex` 保证并发安全，`Register` 持有写锁，所有读方法持有读锁。所有读方法返回防御性拷贝，避免外部修改污染内部状态。
+
+- [x] **步骤 4：验证测试通过**
 
 ```bash
-go test ./internal/egress -run TestRegistryFindsProvidersByModel -v
+go test -race ./internal/egress -run TestRegistry -v
 ```
 
-预期：PASS。
+预期：全部 PASS，无 data race。
 
-- [ ] **步骤 5：提交**
+- [x] **步骤 5：提交**
 
 ```bash
 git add internal/egress/adapter.go internal/egress/adapter_test.go

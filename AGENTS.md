@@ -17,7 +17,8 @@
 - [x] 任务 6：实现 OpenAI 兼容 Provider 适配器 — `internal/egress/openai.go`、`openai_test.go`
 - [x] 任务 7：实现 SSE 流式转换 — （已合并入 `internal/egress/openai.go`）
 - [x] 任务 8：实现 Anthropic Provider 适配器（含流式） — `internal/egress/anthropic.go`、`anthropic_test.go`
-- [ ] 任务 9-20：待依次执行
+- [x] 任务 9：实现 Provider 注册表 — `internal/egress/adapter.go`、`adapter_test.go`
+- [ ] 任务 10-20：待依次执行
 
 ### 实现约束
 
