@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -14,4 +15,18 @@ func TestOpenAICompatibleBuildRequest(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(body), "gpt-4o")
 	require.Contains(t, string(body), "hi")
+}
+
+func TestParseSSELine(t *testing.T) {
+	chunk, done, err := parseSSELine(`data: {"id":"1","model":"gpt-4o","choices":[{"delta":{"content":"hi"}}]}`)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, "hi", chunk.Delta.Content)
+
+	_, done, err = parseSSELine("data: [DONE]")
+	require.NoError(t, err)
+	require.True(t, done)
+
+	_, _, err = parseSSELine(strings.TrimSpace(""))
+	require.NoError(t, err)
 }

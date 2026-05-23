@@ -7,9 +7,66 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/viif/momu-llmgateway/internal/model"
 )
+
+type OpenAICompatible struct {
+	name    string
+	baseURL string
+	apiKey  string
+	models  []string
+	client  *http.Client
+}
+
+func NewOpenAICompatible(name, baseURL, apiKey string, models []string, timeout time.Duration) *OpenAICompatible {
+	return &OpenAICompatible{name: name, baseURL: baseURL, apiKey: apiKey, models: models, client: &http.Client{Timeout: timeout}}
+}
+
+func (p *OpenAICompatible) Name() string { return p.name }
+
+func (p *OpenAICompatible) Models() []string { return p.models }
+
+func (p *OpenAICompatible) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
+	return json.Marshal(map[string]any{"model": req.Model, "messages": req.Messages, "stream": req.Stream, "temperature": req.Temperature, "max_tokens": req.MaxTokens})
+}
+
+func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
+	body, err := p.buildRequestBody(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
+	}
+	var out model.StandardResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	out.Provider = p.name
+	return &out, nil
+}
+
+func (p *OpenAICompatible) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	req.Stream = true
+	body, err := p.buildRequestBody(req)
+	if err != nil {
+		return nil, err
+	}
+	return streamOpenAI(ctx, p.client, p.baseURL+"/chat/completions", p.apiKey, body)
+}
 
 func parseSSELine(line string) (model.StreamChunk, bool, error) {
 	line = strings.TrimSpace(line)
@@ -37,11 +94,7 @@ func parseSSELine(line string) (model.StreamChunk, bool, error) {
 	return chunk, false, nil
 }
 
-func StreamOpenAICompatible(ctx context.Context, client *http.Client, url, apiKey string, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
-	body, err := json.Marshal(map[string]any{"model": req.Model, "messages": req.Messages, "stream": true})
-	if err != nil {
-		return nil, err
-	}
+func streamOpenAI(ctx context.Context, client *http.Client, url, apiKey string, body []byte) (<-chan model.StreamChunk, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
