@@ -21,7 +21,8 @@ type Config struct {
 	SemanticRouting SemanticRoutingConfig     `mapstructure:"semantic_routing"`
 	SemanticCache   SemanticCacheConfig       `mapstructure:"semantic_cache"`
 	Fallback        FallbackConfig            `mapstructure:"fallback"`
-	CircuitBreaker  CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
+	CircuitBreaker  CircuitBreakerConfig  `mapstructure:"circuit_breaker"`
+	Balancer        BalancerConfig        `mapstructure:"balancer"`
 }
 
 type ServerConfig struct {
@@ -100,6 +101,15 @@ type CircuitBreakerConfig struct {
 	FailureThreshold int           `mapstructure:"failure_threshold"`
 	Window           time.Duration `mapstructure:"window"`
 	Cooldown         time.Duration `mapstructure:"cooldown"`
+}
+
+type BalancerConfig struct {
+	ConcurrencyPenaltyCoefficient float64       `mapstructure:"concurrency_penalty_coefficient"`
+	LatencyPenaltyCoefficient     float64       `mapstructure:"latency_penalty_coefficient"`
+	WarmupEnabled                 bool          `mapstructure:"warmup_enabled"`
+	WarmupDuration                time.Duration `mapstructure:"warmup_duration"`
+	HealthWindowSize              time.Duration `mapstructure:"health_window_size"`
+	HealthMinRequests             int           `mapstructure:"health_min_requests"`
 }
 
 func Load(path string) (*Config, error) {

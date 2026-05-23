@@ -49,3 +49,34 @@ routing:
 	require.Equal(t, "sk-test", cfg.Providers["openai"].APIKey)
 	require.Equal(t, 60*time.Second, cfg.Providers["openai"].Timeout)
 }
+
+func TestLoadBalancerConfig(t *testing.T) {
+	path := writeConfig(t, `
+server:
+  port: 8080
+redis:
+  addr: localhost:6379
+auth:
+  api_keys:
+    - key: sk-local
+      name: local
+      rate_limit: 60
+      allowed_models: ["*"]
+providers: {}
+balancer:
+  concurrency_penalty_coefficient: 3.0
+  latency_penalty_coefficient: 2.5
+  warmup_enabled: true
+  warmup_duration: 30s
+  health_window_size: 60s
+  health_min_requests: 10
+`)
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, 3.0, cfg.Balancer.ConcurrencyPenaltyCoefficient)
+	require.Equal(t, 2.5, cfg.Balancer.LatencyPenaltyCoefficient)
+	require.True(t, cfg.Balancer.WarmupEnabled)
+	require.Equal(t, 30*time.Second, cfg.Balancer.WarmupDuration)
+	require.Equal(t, 60*time.Second, cfg.Balancer.HealthWindowSize)
+	require.Equal(t, 10, cfg.Balancer.HealthMinRequests)
+}

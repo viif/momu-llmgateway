@@ -170,17 +170,31 @@ type EmbeddingProvider interface {
 }
 ```
 
-### 加权负载均衡
+### 平滑动态加权负载均衡
 
-同一模型多个 Provider 实例时的权重计算：
+同一模型多个 Provider 实例时的权重计算与调度：
 
-```
-权重 = base_weight × (1 / (1 + active_connections)) × health_score
-```
+动态有效权重计算：
 
-- `base_weight`: 配置的静态权重
-- `active_connections`: 当前并发请求数（原子计数）
-- `health_score`: 基于近期成功率的动态分数 [0, 1]
+$$
+W_{eff} = (W_{base} \times F_{warmup}) \times \left[ \frac{1}{1 + w_1 \cdot R_{active} + w_2 \cdot L_{p99}} \right] \times S_{health}
+$$
+
+- $W_{eff}$：动态有效权重 (effective_weight)，最终参与平滑加权轮询（SWRR）调度的实时权重值。该值越高，该 Provider 节点在本轮调度中被选中的概率越大。
+- $W_{base}$：配置的静态基础权重 (base_weight)，由运维人员在配置中心预先设定的固定权重，通常用于区分不同 Provider 的硬件算力等级（如 A100 集群与 T4 集群）或业务优先级（如付费账号与免费账号）。
+- $F_{warmup}$：慢启动预热系数 \[0, 1] (warmup_factor)，用于保护刚上线或刚从熔断中恢复的节点。取值范围为 \[0, 1]。节点启动初期该值较小（如 0.1），随后随时间线性或指数递增至 1，防止冷节点因初始负载极低而瞬间被流量洪峰击垮。
+- $R_{active}$：当前活跃请求数 (active_requests)，该节点当前正在处理且尚未返回的并发请求总数。使用原子操作（Atomic）进行计数，能够实时反映节点的瞬时并发压力。
+- $L_{p99}$：归一化的 P99 响应延迟 (normalized_p99_latency)，反映节点处理长文本或复杂推理时的真实耗时压力。取该节点近期（如过去 1 分钟）响应时间的 P99 分位值，并映射到 \[0, 1] 区间。延迟越高，该项对权重的衰减作用越明显。
+- $S_{health}$：基于滑动窗口成功率的动态健康分 \[0, 1] (sliding_window_health_score)，基于过去 N 次请求或过去 T 时间窗口内的成功率计算得出的动态分数，取值范围为 \[0, 1]。用于快速感知并规避出现高频 5xx 错误或超时的故障节点。
+- $w_1$ (并发惩罚系数) 用于调节 " 活跃请求数 " 对总权重的衰减力度。$w_1$ 越大，负载均衡器对节点的并发数越敏感，流量越倾向于分散到空闲节点。
+- $w_2$ (延迟惩罚系数) 用于调节 " 响应延迟 " 对总权重的衰减力度。$w_2$ 越大，负载均衡器越倾向于避开处理速度慢的节点，优先保障整体响应时效。
+
+平滑加权轮询调度机制（Smooth Weighted Round-Robin）：
+- 维护动态状态变量： 为每个节点维护一个动态的 current_weight（当前有效权重）状态变量。该变量用于记录节点在连续调度过程中的权重累积情况，是实现流量平滑分配的核心。
+- 权重累积阶段： 在每次发起调度请求时，先将所有候选节点的 current_weight 分别累加上其上一轮计算出的 effective_weight（动态有效权重）。这一步确保了权重高的节点，其 current_weight 的增长速度更快。
+- 最优节点选取： 遍历所有节点，选取当前 current_weight 值最大的节点作为本次请求的目标节点。若存在多个节点 current_weight 相同且均为最大值，则选取遍历顺序中的第一个。
+- 权重扣减与平滑化： 被选中的节点，其 current_weight 需要减去所有候选节点的 total_effective_weight（即所有节点 effective_weight 的总和）。这一步是算法的精髓，它让被选中的节点权重瞬间回落，从而在下一轮调度中让出机会给其他节点，避免了流量的集中突发。
+- 周期性收敛： 通过上述 " 累加 - 选取 - 扣减 " 的循环，各个节点的 current_weight 会在一个周期内动态波动。长期来看，每个节点被选中的频率将严格收敛于其 effective_weight 在总权重中的占比，实现了既平滑又精准的流量分配。
 
 ### 熔断器
 
@@ -466,6 +480,14 @@ fallback:
     gpt-4o: ["claude-sonnet-4-20250514", "gpt-4o-mini"]
     claude-sonnet-4-20250514: ["gpt-4o", "deepseek-chat"]
     deepseek-chat: ["gpt-4o-mini", "qwen-turbo"]
+
+balancer:
+  concurrency_penalty_coefficient: 3.0   # w1, 越大则对并发越敏感
+  latency_penalty_coefficient: 2.0       # w2, 越大则对延迟越敏感
+  warmup_enabled: true
+  warmup_duration: 30s
+  health_window_size: 30s
+  health_min_requests: 10
 
 circuit_breaker:
   failure_threshold: 5

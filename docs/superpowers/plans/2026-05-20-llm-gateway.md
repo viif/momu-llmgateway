@@ -464,6 +464,7 @@ type Config struct {
 	SemanticCache   SemanticCacheConfig   `mapstructure:"semantic_cache"`
 	Fallback        FallbackConfig        `mapstructure:"fallback"`
 	CircuitBreaker  CircuitBreakerConfig  `mapstructure:"circuit_breaker"`
+	Balancer        BalancerConfig        `mapstructure:"balancer"`
 }
 
 type ServerConfig struct {
@@ -542,6 +543,15 @@ type CircuitBreakerConfig struct {
 	FailureThreshold int           `mapstructure:"failure_threshold"`
 	Window           time.Duration `mapstructure:"window"`
 	Cooldown         time.Duration `mapstructure:"cooldown"`
+}
+
+type BalancerConfig struct {
+	ConcurrencyPenaltyCoefficient float64       `mapstructure:"concurrency_penalty_coefficient"`
+	LatencyPenaltyCoefficient     float64       `mapstructure:"latency_penalty_coefficient"`
+	WarmupEnabled                 bool          `mapstructure:"warmup_enabled"`
+	WarmupDuration                time.Duration `mapstructure:"warmup_duration"`
+	HealthWindowSize              time.Duration `mapstructure:"health_window_size"`
+	HealthMinRequests             int           `mapstructure:"health_min_requests"`
 }
 
 func Load(path string) (*Config, error) {
@@ -1707,13 +1717,36 @@ git commit -m "feat: 添加熔断器"
 
 ---
 
-## 任务 11：实现加权负载均衡
+## 任务 11：实现平滑动态加权负载均衡（SWRR）
 
 **文件：**
 - 新建： `internal/decision/balancer.go`
 - 新建： `internal/decision/balancer_test.go`
 
-- [ ] **步骤 1：先写选择测试**
+说明：设计与 spec 中"平滑动态加权负载均衡"对齐。实现六维有效权重公式与平滑加权轮询（SWRR）调度，含预热、并发与延迟惩罚、滑动窗口健康分。高并发优化：EffectiveWeight 在锁外预计算、槽位索引替代 map 查找、单循环合并累加与选择、Register 预分配避免热路径 map 写入。
+
+### 有效权重公式
+
+```
+W_eff = (W_base * F_warmup) * [1 / (1 + w1 * R_active + w2 * L_p99)] * S_health
+```
+
+- `W_base`：配置静态基础权重
+- `F_warmup`：慢启动预热系数 [0, 1]
+- `R_active`：当前活跃请求数（通过原子操作计数）
+- `L_p99`：归一化 P99 延迟 [0, 1]
+- `S_health`：滑动窗口成功率健康分 [0, 1]
+- `w1` / `w2`：并发/延迟惩罚系数（从配置读取）
+
+调度算法：为每个节点维护 `currentWeight` 状态；每轮调度累加 `effectiveWeight` → 选 `currentWeight` 最大者 → 减去 `totalEffectiveWeight`，实现平滑分配并长期收敛于权重占比。
+
+高并发设计：
+- 槽位索引：`[]nodeState` + `nameToSlot map[string]int`，Select 热路径用切片下标直接访问，免字符串 hash
+- 锁外预计算：`EffectiveWeight`（纯函数）在锁外完成，锁仅覆盖 SWRR 状态操作
+- 单循环合并：累加 currentWeight + 选择最大合为一次遍历
+- `Register()` 预分配：启动时批量注册槽位，热路径跳过 map 写入
+
+- [ ] **步骤 1a：先写有效权重计算测试**
 
 文件： `internal/decision/balancer_test.go`
 
@@ -1726,64 +1759,274 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBalancerSelectsHighestEffectiveWeight(t *testing.T) {
-	b := NewBalancer()
-	got := b.Select([]ProviderCandidate{{ProviderName: "a", BaseWeight: 10, HealthScore: 1}, {ProviderName: "b", BaseWeight: 100, HealthScore: 0.1}})
-	require.Equal(t, "a", got.ProviderName)
+func TestEffectiveWeightCalculation(t *testing.T) {
+	cfg := BalancerConfig{
+		ConcurrencyPenaltyCoefficient: 2.0,
+		LatencyPenaltyCoefficient:     1.0,
+	}
+	b := NewBalancer(cfg)
+	eff := b.EffectiveWeight(ProviderCandidate{
+		ProviderName:         "a",
+		BaseWeight:           100,
+		ActiveConnections:    3,
+		NormalizedP99Latency: 0.2,
+		HealthScore:          0.9,
+		WarmupFactor:         1.0,
+	})
+	expected := 100.0 * 1.0 * (1.0 / (1.0 + 2.0*3.0 + 1.0*0.2)) * 0.9
+	require.InDelta(t, expected, eff, 0.001)
+}
+
+func TestEffectiveWeightWarmupReducesWeight(t *testing.T) {
+	cfg := BalancerConfig{
+		ConcurrencyPenaltyCoefficient: 0,
+		LatencyPenaltyCoefficient:     0,
+	}
+	b := NewBalancer(cfg)
+	full := b.EffectiveWeight(ProviderCandidate{BaseWeight: 100, HealthScore: 1, WarmupFactor: 1.0})
+	warm := b.EffectiveWeight(ProviderCandidate{BaseWeight: 100, HealthScore: 1, WarmupFactor: 0.3})
+	require.InDelta(t, 100.0, full, 0.001)
+	require.InDelta(t, 30.0, warm, 0.001)
+	require.Less(t, warm, full)
+}
+```
+
+- [ ] **步骤 1b：先写 SWRR 调度与边界条件测试**
+
+文件： `internal/decision/balancer_test.go`（追加）
+
+```go
+func TestSWRRDistributionFairness(t *testing.T) {
+	cfg := BalancerConfig{
+		ConcurrencyPenaltyCoefficient: 0,
+		LatencyPenaltyCoefficient:     0,
+	}
+	b := NewBalancer(cfg)
+	candidates := []ProviderCandidate{
+		{ProviderName: "a", BaseWeight: 5, HealthScore: 1, WarmupFactor: 1},
+		{ProviderName: "b", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1},
+		{ProviderName: "c", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1},
+	}
+	counts := map[string]int{}
+	for i := 0; i < 700; i++ {
+		c := b.Select(candidates)
+		counts[c.ProviderName]++
+	}
+	aPct := float64(counts["a"]) / 700.0
+	require.InDelta(t, 5.0/7.0, aPct, 0.05)
+}
+
+func TestSelectEmptyCandidates(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	c := b.Select(nil)
+	require.Equal(t, "", c.ProviderName)
+}
+
+func TestSelectSingleCandidate(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	c := b.Select([]ProviderCandidate{{ProviderName: "only", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1}})
+	require.Equal(t, "only", c.ProviderName)
+}
+```
+
+- [ ] **步骤 1c：先写 Register 预分配与槽位索引测试**
+
+文件： `internal/decision/balancer_test.go`（追加）
+
+```go
+func TestRegisterAssignsSequentialSlots(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	require.Equal(t, 0, b.Register("a"))
+	require.Equal(t, 1, b.Register("b"))
+	require.Equal(t, 0, b.Register("a"))
+}
+
+func TestSelectWithRegisteredProviders(t *testing.T) {
+	cfg := BalancerConfig{
+		ConcurrencyPenaltyCoefficient: 0,
+		LatencyPenaltyCoefficient:     0,
+	}
+	b := NewBalancer(cfg)
+	b.Register("a")
+	b.Register("b")
+	c := b.Select([]ProviderCandidate{
+		{ProviderName: "a", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1},
+		{ProviderName: "b", BaseWeight: 100, HealthScore: 1, WarmupFactor: 1},
+	})
+	require.Equal(t, "b", c.ProviderName)
+}
+
+func TestRegisterThenSWRRFairness(t *testing.T) {
+	cfg := BalancerConfig{
+		ConcurrencyPenaltyCoefficient: 0,
+		LatencyPenaltyCoefficient:     0,
+	}
+	b := NewBalancer(cfg)
+	b.Register("a")
+	b.Register("b")
+	b.Register("c")
+	candidates := []ProviderCandidate{
+		{ProviderName: "a", BaseWeight: 5, HealthScore: 1, WarmupFactor: 1},
+		{ProviderName: "b", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1},
+		{ProviderName: "c", BaseWeight: 1, HealthScore: 1, WarmupFactor: 1},
+	}
+	counts := map[string]int{}
+	for i := 0; i < 700; i++ {
+		selected := b.Select(candidates)
+		counts[selected.ProviderName]++
+	}
+	aPct := float64(counts["a"]) / 700.0
+	require.InDelta(t, 5.0/7.0, aPct, 0.05)
 }
 ```
 
 - [ ] **步骤 2：运行测试确认失败**
 
 ```bash
-go test ./internal/decision -run TestBalancerSelectsHighestEffectiveWeight -v
+go test ./internal/decision -run 'TestEffectiveWeightCalculation|TestEffectiveWeightWarmupReducesWeight|TestSWRRDistributionFairness|TestSelectEmptyCandidates|TestSelectSingleCandidate|TestRegisterAssignsSequentialSlots|TestSelectWithRegisteredProviders|TestRegisterThenSWRRFairness' -v
 ```
 
-预期：失败，提示 `NewBalancer` 未定义。
+预期：失败，提示 `BalancerConfig`、`NewBalancer`、`ProviderCandidate`、`EffectiveWeight`、`Select`、`Register` 未定义。
 
-- [ ] **步骤 3：实现负载均衡器**
+- [ ] **步骤 3：实现负载均衡器与 SWRR 调度**
 
 文件： `internal/decision/balancer.go`
 
 ```go
 package decision
 
-type ProviderCandidate struct {
-	ProviderName       string
-	Model              string
-	BaseWeight         float64
-	ActiveConnections  int
-	HealthScore        float64
+import (
+	"math"
+	"sync"
+)
+
+type BalancerConfig struct {
+	ConcurrencyPenaltyCoefficient float64
+	LatencyPenaltyCoefficient     float64
+	WarmupEnabled                 bool
+	WarmupDuration                float64
+	HealthWindowSize              float64
+	HealthMinRequests             int
 }
 
-type Balancer struct{}
+type ProviderCandidate struct {
+	ProviderName         string
+	Model                string
+	BaseWeight           float64
+	ActiveConnections    int
+	NormalizedP99Latency float64
+	HealthScore          float64
+	WarmupFactor         float64
+}
 
-func NewBalancer() *Balancer { return &Balancer{} }
+type nodeState struct {
+	currentWeight float64
+}
+
+type Balancer struct {
+	cfg        BalancerConfig
+	mu         sync.Mutex
+	slots      []nodeState
+	nameToSlot map[string]int
+}
+
+func NewBalancer(cfg BalancerConfig) *Balancer {
+	return &Balancer{
+		cfg:        cfg,
+		nameToSlot: make(map[string]int),
+	}
+}
+
+func (b *Balancer) Register(name string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if slot, ok := b.nameToSlot[name]; ok {
+		return slot
+	}
+	b.slots = append(b.slots, nodeState{})
+	slot := len(b.slots) - 1
+	b.nameToSlot[name] = slot
+	return slot
+}
+
+func (b *Balancer) EffectiveWeight(c ProviderCandidate) float64 {
+	warmup := c.WarmupFactor
+	if warmup <= 0 {
+		warmup = 0
+	}
+	base := c.BaseWeight * warmup
+	denom := 1 + b.cfg.ConcurrencyPenaltyCoefficient*float64(c.ActiveConnections) + b.cfg.LatencyPenaltyCoefficient*c.NormalizedP99Latency
+	loadFactor := 1.0 / denom
+	health := c.HealthScore
+	if health <= 0 {
+		health = 0
+	}
+	return math.Max(base*loadFactor*health, 0)
+}
+
+func (b *Balancer) resolveSlots(candidates []ProviderCandidate) []int {
+	slots := make([]int, len(candidates))
+	for i, c := range candidates {
+		if s, ok := b.nameToSlot[c.ProviderName]; ok {
+			slots[i] = s
+		} else {
+			b.slots = append(b.slots, nodeState{})
+			s := len(b.slots) - 1
+			b.nameToSlot[c.ProviderName] = s
+			slots[i] = s
+		}
+	}
+	return slots
+}
 
 func (b *Balancer) Select(candidates []ProviderCandidate) ProviderCandidate {
-	var best ProviderCandidate
-	bestScore := -1.0
-	for _, c := range candidates {
-		score := c.BaseWeight * (1 / (1 + float64(c.ActiveConnections))) * c.HealthScore
-		if score > bestScore { bestScore = score; best = c }
+	if len(candidates) == 0 {
+		return ProviderCandidate{}
 	}
-	return best
+
+	n := len(candidates)
+	effs := make([]float64, n)
+	totalEff := 0.0
+	for i := range candidates {
+		eff := b.EffectiveWeight(candidates[i])
+		effs[i] = eff
+		totalEff += eff
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	slots := b.resolveSlots(candidates)
+
+	var bestIdx int
+	var bestWeight float64 = -1 << 63
+	for i := range candidates {
+		b.slots[slots[i]].currentWeight += effs[i]
+		if cw := b.slots[slots[i]].currentWeight; cw > bestWeight {
+			bestWeight = cw
+			bestIdx = i
+		}
+	}
+
+	b.slots[slots[bestIdx]].currentWeight -= totalEff
+
+	return candidates[bestIdx]
 }
 ```
 
 - [ ] **步骤 4：验证测试通过**
 
 ```bash
-go test ./internal/decision -run TestBalancerSelectsHighestEffectiveWeight -v
+go test ./internal/decision -v
 ```
 
-预期：PASS。
+预期：全部 PASS。
 
 - [ ] **步骤 5：提交**
 
 ```bash
 git add internal/decision/balancer.go internal/decision/balancer_test.go
-git commit -m "feat: 添加加权 provider 负载均衡"
+git commit -m "feat: 实现平滑动态加权负载均衡（SWRR）"
 ```
 
 ---
@@ -1796,6 +2039,8 @@ git commit -m "feat: 添加加权 provider 负载均衡"
 - 新建： `internal/decision/strategy_semantic.go`
 - 新建： `internal/decision/router.go`
 - 新建： `internal/decision/router_test.go`
+
+说明：路由策略链按优先级执行（显式路由 → 语义路由 → 能力路由 → 成本级联 → 默认路由）。决策出模型后，通过 `Balancer` 在同模型多 Provider 间进行负载均衡选择。
 
 - [ ] **步骤 1：先写显式路由和默认路由测试**
 
@@ -1812,7 +2057,7 @@ import (
 )
 
 func TestRouterExplicitProviderPrefix(t *testing.T) {
-	r := NewRouter([]string{"deepseek-chat"})
+	r := NewRouter([]string{"deepseek-chat"}, nil, nil)
 	decision, err := r.Route(&model.StandardRequest{Model: "openai/gpt-4o"})
 	require.NoError(t, err)
 	require.Equal(t, "openai", decision.ProviderName)
@@ -1820,17 +2065,35 @@ func TestRouterExplicitProviderPrefix(t *testing.T) {
 }
 
 func TestRouterDefaultModel(t *testing.T) {
-	r := NewRouter([]string{"deepseek-chat"})
+	r := NewRouter([]string{"deepseek-chat"}, nil, nil)
 	decision, err := r.Route(&model.StandardRequest{Model: ""})
 	require.NoError(t, err)
 	require.Equal(t, "deepseek-chat", decision.Model)
+}
+
+func TestRouterWithBalancerSelectsProvider(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	candidatesFn := func(model string) []ProviderCandidate {
+		if model == "gpt-4o" {
+			return []ProviderCandidate{
+				{ProviderName: "openai", Model: "gpt-4o", BaseWeight: 1, HealthScore: 0, WarmupFactor: 1},
+				{ProviderName: "deepseek", Model: "gpt-4o", BaseWeight: 100, HealthScore: 1, WarmupFactor: 1},
+			}
+		}
+		return nil
+	}
+	r := NewRouter(nil, b, candidatesFn)
+	decision, err := r.Route(&model.StandardRequest{Model: "gpt-4o"})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek", decision.ProviderName)
+	require.Equal(t, "gpt-4o", decision.Model)
 }
 ```
 
 - [ ] **步骤 2：运行测试确认失败**
 
 ```bash
-go test ./internal/decision -run 'TestRouterExplicitProviderPrefix|TestRouterDefaultModel' -v
+go test ./internal/decision -run 'TestRouterExplicitProviderPrefix|TestRouterDefaultModel|TestRouterWithBalancerSelectsProvider' -v
 ```
 
 预期：失败，提示 `NewRouter` 未定义。
@@ -1850,18 +2113,46 @@ import (
 
 type RouteDecision struct { ProviderName string; Model string }
 
-type Router struct { defaultCascade []string }
+type ModelCandidatesFunc func(model string) []ProviderCandidate
 
-func NewRouter(defaultCascade []string) *Router { return &Router{defaultCascade: defaultCascade} }
+type Router struct {
+	defaultCascade  []string
+	balancer        *Balancer
+	modelCandidates ModelCandidatesFunc
+}
+
+func NewRouter(defaultCascade []string, balancer *Balancer, candidatesFn ModelCandidatesFunc) *Router {
+	return &Router{defaultCascade: defaultCascade, balancer: balancer, modelCandidates: candidatesFn}
+}
 
 func (r *Router) Route(req *model.StandardRequest) (RouteDecision, error) {
+	var providerName, modelName string
+
 	if strings.Contains(req.Model, "/") {
 		parts := strings.SplitN(req.Model, "/", 2)
-		return RouteDecision{ProviderName: parts[0], Model: parts[1]}, nil
+		providerName = parts[0]
+		modelName = parts[1]
+	} else if req.Model != "" {
+		modelName = req.Model
+	} else if len(r.defaultCascade) > 0 {
+		modelName = r.defaultCascade[0]
 	}
-	if req.Model != "" { return RouteDecision{Model: req.Model}, nil }
-	if len(r.defaultCascade) > 0 { return RouteDecision{Model: r.defaultCascade[0]}, nil }
-	return RouteDecision{}, model.NewError(model.ErrCodeModelNotFound, "no route matched")
+
+	if modelName == "" && providerName == "" {
+		return RouteDecision{}, model.NewError(model.ErrCodeModelNotFound, "no route matched")
+	}
+
+	if providerName == "" && r.balancer != nil && r.modelCandidates != nil {
+		candidates := r.modelCandidates(modelName)
+		if len(candidates) > 0 {
+			selected := r.balancer.Select(candidates)
+			if selected.ProviderName != "" {
+				return RouteDecision{ProviderName: selected.ProviderName, Model: selected.Model}, nil
+			}
+		}
+	}
+
+	return RouteDecision{ProviderName: providerName, Model: modelName}, nil
 }
 ```
 

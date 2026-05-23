@@ -80,3 +80,10 @@ circuit_breaker:
   failure_threshold: 5
   window: 10s
   cooldown: 30s
+balancer:
+  concurrency_penalty_coefficient: 3.0
+  latency_penalty_coefficient: 2.0
+  warmup_enabled: true
+  warmup_duration: 30s
+  health_window_size: 30s
+  health_min_requests: 10
