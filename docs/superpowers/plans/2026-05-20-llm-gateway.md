@@ -106,7 +106,69 @@ git commit -m "feat: scaffold llm gateway project"
 
 ---
 
-## 任务 2：定义核心数据模型
+## 任务 2：添加 GitHub Actions CI（基础版本）
+
+> CI 内容将在后续任务中逐步丰富。基础版本先保证构建和测试可在 CI 中自动运行。
+
+**文件：**
+- 新建： `.github/workflows/ci.yml`
+
+- [ ] **步骤 1：创建基础 CI workflow**
+
+文件： `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./...
+```
+
+- [ ] **步骤 2：验证 YAML 可解析**
+
+```bash
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"
+```
+
+预期：无输出、无错误。
+
+- [ ] **步骤 3：验证构建和测试**
+
+```bash
+go build ./...
+go test ./...
+```
+
+预期：全部通过。
+
+- [ ] **步骤 4：提交**
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "ci: add github actions basic build and test workflow"
+```
+
+> **CI 逐步丰富说明：** 本任务建立 CI 基础骨架。后续每个新任务在增加代码和测试的同时，CI 也会随之验证更多内容。最终会在 CI 中逐步补充 lint 检查、竞态检测、覆盖率上报等增强步骤（参见任务 19）。
+
+---
+
+## 任务 3：定义核心数据模型
 
 **文件：**
 - 新建： `internal/model/request.go`
@@ -302,7 +364,7 @@ git commit -m "feat: add core gateway data models"
 
 ---
 
-## 任务 3：实现配置加载、环境变量展开和原子热更新
+## 任务 4：实现配置加载、环境变量展开和原子热更新
 
 **文件：**
 - 新建： `internal/config/config.go`
@@ -636,7 +698,7 @@ git commit -m "feat: add viper config loading and hot reload"
 
 ---
 
-## 任务 4：实现可观测性基础设施
+## 任务 5：实现可观测性基础设施
 
 **文件：**
 - 新建： `internal/observability/logger.go`
@@ -759,7 +821,7 @@ git commit -m "feat: add observability primitives"
 
 ---
 
-## 任务 5：实现 OpenAI 兼容 Provider 适配器
+## 任务 6：实现 OpenAI 兼容 Provider 适配器
 
 **文件：**
 - 新建： `internal/egress/openai_compat.go`
@@ -872,7 +934,7 @@ git commit -m "feat: add openai-compatible provider adapter"
 
 ---
 
-## 任务 6：实现 SSE 流式转换
+## 任务 7：实现 SSE 流式转换
 
 **文件：**
 - 新建： `internal/egress/stream.go`
@@ -988,7 +1050,7 @@ git commit -m "feat: add sse stream conversion"
 
 ---
 
-## 任务 7：实现 Anthropic 与 GLM Provider 适配器
+## 任务 8：实现 Anthropic 与 GLM Provider 适配器
 
 **文件：**
 - 新建： `internal/egress/anthropic.go`
@@ -1146,7 +1208,7 @@ git commit -m "feat: add anthropic and glm adapters"
 
 ---
 
-## 任务 8：实现 Provider 注册表
+## 任务 9：实现 Provider 注册表
 
 **文件：**
 - 新建： `internal/egress/adapter.go`
@@ -1238,7 +1300,7 @@ git commit -m "feat: add provider registry"
 
 ---
 
-## 任务 9：实现熔断器
+## 任务 10：实现熔断器
 
 **文件：**
 - 新建： `internal/decision/circuitbreaker.go`
@@ -1346,7 +1408,7 @@ git commit -m "feat: add circuit breaker"
 
 ---
 
-## 任务 10：实现加权负载均衡
+## 任务 11：实现加权负载均衡
 
 **文件：**
 - 新建： `internal/decision/balancer.go`
@@ -1427,7 +1489,7 @@ git commit -m "feat: add weighted provider balancer"
 
 ---
 
-## 任务 11：实现路由策略链
+## 任务 12：实现路由策略链
 
 **文件：**
 - 新建： `internal/decision/strategy_capability.go`
@@ -1547,7 +1609,7 @@ git commit -m "feat: add routing strategy chain"
 
 ---
 
-## 任务 12：实现语义缓存
+## 任务 13：实现语义缓存
 
 **文件：**
 - 新建： `internal/cache/semantic.go`
@@ -1626,7 +1688,7 @@ git commit -m "feat: add semantic cache primitives"
 
 ---
 
-## 任务 13：实现 Fallback 引擎
+## 任务 14：实现 Fallback 引擎
 
 **文件：**
 - 新建： `internal/fallback/engine.go`
@@ -1697,7 +1759,7 @@ git commit -m "feat: add fallback engine"
 
 ---
 
-## 任务 14：实现认证、限流和日志中间件
+## 任务 15：实现认证、限流和日志中间件
 
 **文件：**
 - 新建： `internal/ingress/middleware_auth.go`
@@ -1818,7 +1880,7 @@ git commit -m "feat: add ingress middleware"
 
 ---
 
-## 任务 15：实现 HTTP Handler
+## 任务 16：实现 HTTP Handler
 
 **文件：**
 - 新建： `internal/ingress/handler.go`
@@ -1901,7 +1963,7 @@ git commit -m "feat: add http route handlers"
 
 ---
 
-## 任务 16：在 main.go 中组装服务
+## 任务 17：在 main.go 中组装服务
 
 **文件：**
 - 修改： `cmd/gateway/main.go`
@@ -1978,7 +2040,7 @@ git commit -m "feat: wire gateway server startup"
 
 ---
 
-## 任务 17：添加 Dockerfile
+## 任务 18：添加 Dockerfile
 
 **文件：**
 - 新建： `Dockerfile`
@@ -2022,12 +2084,14 @@ git commit -m "feat: add gateway dockerfile"
 
 ---
 
-## 任务 18：添加 GitHub Actions CI
+## 任务 19：完善 GitHub Actions CI（加入 lint、竞态检测、覆盖率上报）
+
+> 任务 2 已建立基础 CI（build + test），本任务在其基础上增加 lint 检查、竞态检测（`-race`）和覆盖率上报步骤。
 
 **文件：**
-- 新建： `.github/workflows/ci.yml`
+- 修改： `.github/workflows/ci.yml`
 
-- [ ] **步骤 1：创建 CI workflow**
+- [ ] **步骤 1：升级 CI workflow**
 
 文件： `.github/workflows/ci.yml`
 
@@ -2098,12 +2162,12 @@ PY
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "feat: add lint and test ci workflow"
+git commit -m "ci: add lint, race detection and coverage upload"
 ```
 
 ---
 
-## 任务 19：端到端手动验证
+## 任务 20：端到端手动验证
 
 **文件：**
 - 修改： none
@@ -2168,24 +2232,25 @@ git commit -m "fix: complete gateway end-to-end verification"
 
 ```text
 任务 1 工程骨架
-  -> 任务 2 核心模型
-      -> 任务 3 配置
-      -> 任务 4 可观测性
-      -> 任务 5 OpenAI 兼容适配器
-          -> 任务 6 SSE 流式转换
-          -> 任务 7 Anthropic/GLM 适配器
-          -> 任务 8 Provider 注册表
-      -> 任务 9 熔断器
-      -> 任务 10 负载均衡
-      -> 任务 11 路由策略
-      -> 任务 12 语义缓存
-      -> 任务 13 Fallback
-      -> 任务 14 中间件
-      -> 任务 15 Handler
-          -> 任务 16 main.go 组装
-              -> 任务 17 Dockerfile
-              -> 任务 18 CI
-              -> 任务 19 端到端验证
+  -> 任务 2 CI（基础版本）
+  -> 任务 3 核心模型
+      -> 任务 4 配置
+      -> 任务 5 可观测性
+      -> 任务 6 OpenAI 兼容适配器
+          -> 任务 7 SSE 流式转换
+          -> 任务 8 Anthropic/GLM 适配器
+          -> 任务 9 Provider 注册表
+      -> 任务 10 熔断器
+      -> 任务 11 负载均衡
+      -> 任务 12 路由策略
+      -> 任务 13 语义缓存
+      -> 任务 14 Fallback
+      -> 任务 15 中间件
+      -> 任务 16 Handler
+          -> 任务 17 main.go 组装
+              -> 任务 18 Dockerfile
+              -> 任务 19 完善 CI
+              -> 任务 20 端到端验证
 ```
 
 ## 自检结果
@@ -2193,4 +2258,4 @@ git commit -m "fix: complete gateway end-to-end verification"
 - Spec 覆盖：配置热加载、环境变量展开、OpenAI/Anthropic/DeepSeek/Qwen/GLM Provider、路由策略、熔断、负载均衡、语义缓存、Fallback、认证、限流、日志、Prometheus、Dockerfile、GitHub Actions CI、手动验证均有对应任务。
 - CI 对齐：`.github/workflows/ci.yml` 只包含 `lint` 和 `test` job；不包含镜像构建 job。
 - 占位符检查：未发现占位式待补内容。
-- 类型一致性：核心类型从任务 2 定义，后续任务统一引用 `model.StandardRequest`、`model.StandardResponse`、`model.Provider`、`model.StreamChunk`。
+- 类型一致性：核心类型从任务 3 定义，后续任务统一引用 `model.StandardRequest`、`model.StandardResponse`、`model.Provider`、`model.StreamChunk`。

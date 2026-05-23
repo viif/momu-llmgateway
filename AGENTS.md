@@ -5,12 +5,13 @@
 仓库已进入实现阶段。设计文档和分步实施计划：
 
 - `docs/superpowers/specs/2026-05-20-llm-gateway-design.md` — 产品与架构设计文档
-- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（15 个任务、按 TDD 逐项实施）
+- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（20 个任务、按 TDD 逐项实施）
 
 ### 实施进度
 
 - [x] 任务 1：初始化 Go 工程骨架 — `go.mod`、目录结构、最小入口 `cmd/gateway/main.go`
-- [ ] 任务 2-15：待依次执行
+- [ ] 任务 2：添加 GitHub Actions CI（基础版本）
+- [ ] 任务 3-20：待依次执行
 
 ### 实现约束
 
