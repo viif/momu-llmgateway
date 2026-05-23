@@ -117,5 +117,6 @@ Provider API Key 在 `configs/gateway.yaml` 中使用 `${OPENAI_API_KEY}` 等环
 
 ## 工作流程
 
+- 每项任务完成后，必须同步更新 AGENTS.md 中的实施进度（将对应的 `[ ]` 改为 `[x]`），确保进度与实际完成情况一致
 - 每次修改代码或文件后，**暂停等待用户确认**，不自动提交
 - 只有在用户明确要求时，才执行 `git add` / `git commit` / `git push` 等操作
