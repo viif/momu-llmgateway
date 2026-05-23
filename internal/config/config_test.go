@@ -32,7 +32,7 @@ auth:
       allowed_models: ["*"]
 providers:
   openai:
-    type: openai_compat
+    type: openai
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
     models: ["gpt-4o"]

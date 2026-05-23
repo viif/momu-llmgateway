@@ -14,7 +14,7 @@ auth:
       allowed_models: ["*"]
 providers:
   openai:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.openai.com/v1"
     api_key: "${OPENAI_API_KEY}"
     models: ["gpt-4o", "gpt-4o-mini"]
@@ -28,21 +28,21 @@ providers:
     weight: 80
     timeout: 60s
   deepseek:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.deepseek.com/v1"
     api_key: "${DEEPSEEK_API_KEY}"
     models: ["deepseek-chat", "deepseek-reasoner"]
     weight: 90
     timeout: 60s
   qwen:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${QWEN_API_KEY}"
     models: ["qwen-turbo", "qwen-plus", "qwen-max"]
     weight: 85
     timeout: 60s
   glm:
-    type: "glm"
+    type: "openai"
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     api_key: "${GLM_API_KEY}"
     models: ["glm-4", "glm-4-flash"]

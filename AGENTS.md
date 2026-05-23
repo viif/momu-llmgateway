@@ -14,9 +14,10 @@
 - [x] 任务 3：定义核心数据模型 — `internal/model/request.go`、`provider.go`、`errors.go`
 - [x] 任务 4：实现配置加载、环境变量展开和原子热更新 — `internal/config/config.go`、`configs/gateway.yaml`
 - [x] 任务 5：实现可观测性基础设施 — `internal/observability/logger.go`、`metrics.go`、`tracing.go`
-- [x] 任务 6：实现 OpenAI 兼容 Provider 适配器 — `internal/egress/openai_compat.go`、`openai_compat_test.go`
-- [x] 任务 7：实现 SSE 流式转换 — `internal/egress/stream.go`、`stream_test.go`
-- [ ] 任务 8-20：待依次执行
+- [x] 任务 6：实现 OpenAI 兼容 Provider 适配器 — `internal/egress/openai.go`、`openai_test.go`
+- [x] 任务 7：实现 SSE 流式转换 — （已合并入 `internal/egress/openai.go`）
+- [x] 任务 8：实现 Anthropic Provider 适配器（含流式） — `internal/egress/anthropic.go`、`anthropic_test.go`
+- [ ] 任务 9-20：待依次执行
 
 ### 实现约束
 

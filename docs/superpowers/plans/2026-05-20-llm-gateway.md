@@ -20,10 +20,8 @@
 - `internal/observability/logger.go`：Zap 日志初始化。
 - `internal/observability/metrics.go`：Prometheus 指标定义与注册。
 - `internal/observability/tracing.go`：RequestID 注入与上下文传递。
-- `internal/egress/openai_compat.go`：OpenAI 兼容 Provider 基类，复用给 OpenAI、DeepSeek、Qwen。
-- `internal/egress/anthropic.go`：Anthropic Messages API 适配器。
-- `internal/egress/glm.go`：智谱 GLM API 适配器。
-- `internal/egress/stream.go`：上游 SSE 到 OpenAI 格式 SSE 的转换。
+- `internal/egress/openai.go`：OpenAI 兼容 Provider 基类（含 SSE 流式处理），复用给 OpenAI、DeepSeek、Qwen、GLM。
+- `internal/egress/anthropic.go`：Anthropic Messages API 适配器（含独立 SSE 解析）。
 - `internal/egress/adapter.go`：Provider 注册表与按模型查找。
 - `internal/decision/circuitbreaker.go`：Provider+Model 维度的 Closed/Open/Half-Open 熔断器。
 - `internal/decision/balancer.go`：同模型多 Provider 的加权负载均衡。
@@ -410,7 +408,7 @@ auth:
       allowed_models: ["*"]
 providers:
   openai:
-    type: openai_compat
+    type: openai
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}
     models: ["gpt-4o"]
@@ -613,7 +611,7 @@ auth:
       allowed_models: ["*"]
 providers:
   openai:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.openai.com/v1"
     api_key: "${OPENAI_API_KEY}"
     models: ["gpt-4o", "gpt-4o-mini"]
@@ -627,21 +625,21 @@ providers:
     weight: 80
     timeout: 60s
   deepseek:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.deepseek.com/v1"
     api_key: "${DEEPSEEK_API_KEY}"
     models: ["deepseek-chat", "deepseek-reasoner"]
     weight: 90
     timeout: 60s
   qwen:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${QWEN_API_KEY}"
     models: ["qwen-turbo", "qwen-plus", "qwen-max"]
     weight: 85
     timeout: 60s
   glm:
-    type: "glm"
+    type: "openai"
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     api_key: "${GLM_API_KEY}"
     models: ["glm-4", "glm-4-flash"]
@@ -824,12 +822,12 @@ git commit -m "feat: 添加可观测性基础设施"
 ## 任务 6：实现 OpenAI 兼容 Provider 适配器
 
 **文件：**
-- 新建： `internal/egress/openai_compat.go`
-- 新建： `internal/egress/openai_compat_test.go`
+- 新建： `internal/egress/openai.go`
+- 新建： `internal/egress/openai_test.go`
 
 - [ ] **步骤 1：先写请求转换测试**
 
-文件： `internal/egress/openai_compat_test.go`
+文件： `internal/egress/openai_test.go`
 
 ```go
 package egress
@@ -861,7 +859,7 @@ go test ./internal/egress -run TestOpenAICompatibleBuildRequest -v
 
 - [ ] **步骤 3：实现 OpenAI 兼容适配器**
 
-文件： `internal/egress/openai_compat.go`
+文件： `internal/egress/openai.go`
 
 ```go
 package egress
@@ -928,7 +926,7 @@ go test ./internal/egress -run TestOpenAICompatibleBuildRequest -v
 - [ ] **步骤 5：提交**
 
 ```bash
-git add internal/egress/openai_compat.go internal/egress/openai_compat_test.go
+git add internal/egress/openai.go internal/egress/openai_test.go
 git commit -m "feat: 添加 openai 兼容 provider 适配器"
 ```
 
@@ -936,13 +934,15 @@ git commit -m "feat: 添加 openai 兼容 provider 适配器"
 
 ## 任务 7：实现 SSE 流式转换
 
+> **注：** 实现后 `parseSSELine` 和 `streamOpenAI` 已合并入 `internal/egress/openai.go`，不再维护独立文件。
+
 **文件：**
-- 新建： `internal/egress/stream.go`
-- 新建： `internal/egress/stream_test.go`
+- 新建： `internal/egress/stream_openai.go`（后合并入 `openai.go`）
+- 新建： `internal/egress/stream_openai_test.go`（后合并入 `openai_test.go`）
 
 - [ ] **步骤 1：先写 SSE 解析测试**
 
-文件： `internal/egress/stream_test.go`
+文件： `internal/egress/stream_openai_test.go`
 
 ```go
 package egress
@@ -979,7 +979,7 @@ go test ./internal/egress -run TestParseSSELine -v
 
 - [ ] **步骤 3：实现 SSE 解析和转发入口**
 
-文件： `internal/egress/stream.go`
+文件： `internal/egress/stream_openai.go`
 
 ```go
 package egress
@@ -1044,19 +1044,25 @@ go test ./internal/egress -run TestParseSSELine -v
 - [ ] **步骤 5：提交**
 
 ```bash
-git add internal/egress/stream.go internal/egress/stream_test.go
+git add internal/egress/stream_openai.go internal/egress/stream_openai_test.go
 git commit -m "feat: 添加 sse 流式转换"
+
+>（后合并入 `internal/egress/openai.go`）
 ```
 
 ---
 
-## 任务 8：实现 Anthropic 与 GLM Provider 适配器
+## 任务 8：实现 Anthropic Provider 适配器（含流式）
+
+**注：GLM 已确认与 DeepSeek/Qwen 同为 OpenAI 兼容，直接在配置中使用 `type: "openai"` 复用，无需独立适配器。**
 
 **文件：**
 - 新建： `internal/egress/anthropic.go`
-- 新建： `internal/egress/glm.go`
 - 新建： `internal/egress/anthropic_test.go`
-- 新建： `internal/egress/glm_test.go`
+
+本任务分两阶段：
+- **阶段 A（步骤 1-4）**：实现 Anthropic 基础适配器（system 消息提升、Messages API 协议转换）
+- **阶段 B（步骤 5-10）**：实现 Anthropic 独立 SSE 流式转换
 
 - [ ] **步骤 1：先写协议转换测试**
 
@@ -1082,32 +1088,10 @@ func TestAnthropicExtractsSystemMessage(t *testing.T) {
 }
 ```
 
-文件： `internal/egress/glm_test.go`
-
-```go
-package egress
-
-import (
-	"testing"
-	"time"
-
-	"github.com/stretchr/testify/require"
-	"github.com/viif/momu-llmgateway/internal/model"
-)
-
-func TestGLMBuildRequest(t *testing.T) {
-	p := NewGLM("https://example.test", "sk", []string{"glm-4"}, time.Second)
-	body, err := p.buildRequestBody(&model.StandardRequest{Model: "glm-4", Messages: []model.Message{{Role: "user", Content: "hi"}}})
-	require.NoError(t, err)
-	require.Contains(t, string(body), "glm-4")
-	require.Contains(t, string(body), "hi")
-}
-```
-
 - [ ] **步骤 2：运行测试确认失败**
 
 ```bash
-go test ./internal/egress -run 'TestAnthropicExtractsSystemMessage|TestGLMBuildRequest' -v
+go test ./internal/egress -run TestAnthropicExtractsSystemMessage -v
 ```
 
 预期：失败，提示构造函数未定义。
@@ -1129,81 +1113,304 @@ import (
 	"github.com/viif/momu-llmgateway/internal/model"
 )
 
-type Anthropic struct { baseURL, apiKey string; models []string; client *http.Client }
+type Anthropic struct {
+	baseURL string
+	apiKey  string
+	models  []string
+	client  *http.Client
+}
 
 func NewAnthropic(baseURL, apiKey string, models []string, timeout time.Duration) *Anthropic {
 	return &Anthropic{baseURL: baseURL, apiKey: apiKey, models: models, client: &http.Client{Timeout: timeout}}
 }
+
 func (p *Anthropic) Name() string { return "anthropic" }
+
 func (p *Anthropic) Models() []string { return p.models }
+
 func (p *Anthropic) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
 	system := ""
 	messages := make([]model.Message, 0, len(req.Messages))
-	for _, m := range req.Messages { if m.Role == "system" { system = m.Content; continue }; messages = append(messages, m) }
+	for _, m := range req.Messages {
+		if m.Role == "system" {
+			system = m.Content
+			continue
+		}
+		messages = append(messages, m)
+	}
 	return json.Marshal(map[string]any{"model": req.Model, "system": system, "messages": messages, "max_tokens": req.MaxTokens})
 }
+
 func (p *Anthropic) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
-	body, err := p.buildRequestBody(req); if err != nil { return nil, err }
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", bytes.NewReader(body)); if err != nil { return nil, err }
-	httpReq.Header.Set("x-api-key", p.apiKey); httpReq.Header.Set("anthropic-version", "2023-06-01"); httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(httpReq); if err != nil { return nil, err }
-	defer resp.Body.Close(); if resp.StatusCode >= 400 { return nil, model.NewError(model.ErrCodeProviderError, resp.Status) }
-	return &model.StandardResponse{Model: req.Model, Provider: p.Name()}, nil
+	body, err := p.buildRequestBody(req)
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
+	}
+	var raw struct {
+		ID      string `json:"id"`
+		Model   string `json:"model"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, err
+	}
+	out := &model.StandardResponse{
+		ID:       raw.ID,
+		Model:    raw.Model,
+		Provider: p.Name(),
+		Usage: model.Usage{
+			PromptTokens:     raw.Usage.InputTokens,
+			CompletionTokens: raw.Usage.OutputTokens,
+			TotalTokens:      raw.Usage.InputTokens + raw.Usage.OutputTokens,
+		},
+	}
+	if len(raw.Content) > 0 {
+		out.Choices = []model.Choice{
+			{
+				Index:        0,
+				Message:      model.Message{Role: "assistant", Content: raw.Content[0].Text},
+				FinishReason: "stop",
+			},
+		}
+	}
+	return out, nil
 }
-func (p *Anthropic) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) { return nil, model.NewError(model.ErrCodeProviderError, "anthropic streaming adapter not wired yet") }
+
+func (p *Anthropic) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	return nil, model.NewError(model.ErrCodeProviderError, "anthropic streaming adapter not wired yet")
+}
 ```
 
-- [ ] **步骤 4：实现 GLM 适配器**
-
-文件： `internal/egress/glm.go`
-
-```go
-package egress
-
-import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"net/http"
-	"time"
-
-	"github.com/viif/momu-llmgateway/internal/model"
-)
-
-type GLM struct { baseURL, apiKey string; models []string; client *http.Client }
-
-func NewGLM(baseURL, apiKey string, models []string, timeout time.Duration) *GLM {
-	return &GLM{baseURL: baseURL, apiKey: apiKey, models: models, client: &http.Client{Timeout: timeout}}
-}
-func (p *GLM) Name() string { return "glm" }
-func (p *GLM) Models() []string { return p.models }
-func (p *GLM) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
-	return json.Marshal(map[string]any{"model": req.Model, "messages": req.Messages, "temperature": req.Temperature, "max_tokens": req.MaxTokens, "stream": req.Stream})
-}
-func (p *GLM) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
-	body, err := p.buildRequestBody(req); if err != nil { return nil, err }
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body)); if err != nil { return nil, err }
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey); httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := p.client.Do(httpReq); if err != nil { return nil, err }
-	defer resp.Body.Close(); if resp.StatusCode >= 400 { return nil, model.NewError(model.ErrCodeProviderError, resp.Status) }
-	return &model.StandardResponse{Model: req.Model, Provider: p.Name()}, nil
-}
-func (p *GLM) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) { return StreamOpenAICompatible(ctx, p.client, p.baseURL+"/chat/completions", p.apiKey, req) }
-```
-
-- [ ] **步骤 5：验证测试通过**
+- [ ] **步骤 4：验证测试通过并提交**
 
 ```bash
-go test ./internal/egress -run 'TestAnthropicExtractsSystemMessage|TestGLMBuildRequest' -v
+go test ./internal/egress -run TestAnthropicExtractsSystemMessage -v
 ```
 
 预期：PASS。
 
-- [ ] **步骤 6：提交**
+```bash
+git add internal/egress/anthropic.go internal/egress/anthropic_test.go
+git commit -m "feat: 添加 anthropic 适配器"
+```
+
+> 阶段 A 完成。以下为阶段 B：流式响应实现。
+
+---
+
+### 流式响应背景
+
+**Anthropic SSE 格式与 OpenAI 不同**，使用 `event:` + `data:` 双行结构：
+
+| SSE Event | 用途 | 转换到 StreamChunk |
+|-----------|------|-------------------|
+| `message_start` | 返回 message id/model | 设置 `chunk.ID`、`chunk.Model`，发出 `Delta.Role: "assistant"` |
+| `content_block_delta` | 携带 `delta.text`（文本增量） | 映射到 `chunk.Delta.Content` |
+| `message_delta` | 携带 `delta.stop_reason`、`usage` | 提取 finish_reason |
+| `message_stop` | 流结束 | 发送 `chunk.Done: true` |
+| `ping` | 心跳 | 忽略 |
+
+- [ ] **步骤 5：先写 Anthropic SSE 事件解析测试**
+
+文件： `internal/egress/anthropic_test.go`（追加）
+
+```go
+func TestAnthropicParseSSEEvent(t *testing.T) {
+	// content_block_delta: 提取 delta.text
+	chunk, done, err := parseAnthropicSSEEvent("content_block_delta", ` {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, "Hello", chunk.Delta.Content)
+
+	// message_start: 提取 message id/model，输出 assistant role
+	chunk, done, err = parseAnthropicSSEEvent("message_start", ` {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-20250514"}}`)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, "msg_1", chunk.ID)
+	require.Equal(t, "assistant", chunk.Delta.Role)
+
+	// message_stop: 流结束
+	chunk, done, err = parseAnthropicSSEEvent("message_stop", ` {"type":"message_stop"}`)
+	require.NoError(t, err)
+	require.True(t, done)
+
+	// ping: 忽略
+	chunk, done, err = parseAnthropicSSEEvent("ping", ` {"type":"ping"}`)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Empty(t, chunk.Delta.Content)
+
+	// 空行: 忽略
+	_, _, err = parseAnthropicSSEEvent("", "")
+	require.NoError(t, err)
+}
+```
+
+- [ ] **步骤 6：运行测试确认失败**
 
 ```bash
-git add internal/egress/anthropic.go internal/egress/glm.go internal/egress/*_test.go
-git commit -m "feat: 添加 anthropic 和 glm 适配器"
+go test ./internal/egress -run TestAnthropicParseSSEEvent -v
+```
+
+预期：失败，提示 `parseAnthropicSSEEvent` 未定义。
+
+- [ ] **步骤 7：实现 Anthropic SSE 解析和流式连接**
+
+文件： `internal/egress/anthropic.go`（追加）
+
+> 需要新增 import：`"bufio"`、`"strings"`
+
+```go
+func parseAnthropicSSEEvent(eventType, data string) (model.StreamChunk, bool, error) {
+	eventType = strings.TrimSpace(eventType)
+	data = strings.TrimSpace(data)
+	if eventType == "" && data == "" {
+		return model.StreamChunk{}, false, nil
+	}
+	if !strings.HasPrefix(data, "{") {
+		return model.StreamChunk{}, false, nil
+	}
+	var raw struct {
+		Type    string `json:"type"`
+		Message struct {
+			ID    string `json:"id"`
+			Role  string `json:"role"`
+			Model string `json:"model"`
+		} `json:"message"`
+		Delta struct {
+			Type       string `json:"type"`
+			Text       string `json:"text"`
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
+		Index int `json:"index"`
+	}
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return model.StreamChunk{}, false, err
+	}
+	switch raw.Type {
+	case "message_start":
+		return model.StreamChunk{ID: raw.Message.ID, Model: raw.Message.Model, Delta: model.Delta{Role: raw.Message.Role}}, false, nil
+	case "content_block_delta":
+		if raw.Delta.Type == "text_delta" {
+			return model.StreamChunk{Delta: model.Delta{Content: raw.Delta.Text}}, false, nil
+		}
+	case "message_stop":
+		return model.StreamChunk{Done: true}, true, nil
+	}
+	return model.StreamChunk{}, false, nil
+}
+
+func StreamAnthropic(ctx context.Context, client *http.Client, url, apiKey string, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	system := ""
+	messages := make([]model.Message, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		if m.Role == "system" { system = m.Content; continue }
+		messages = append(messages, m)
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":      req.Model,
+		"system":     system,
+		"messages":   messages,
+		"max_tokens": req.MaxTokens,
+		"stream":     true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("x-api-key", apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		resp.Body.Close()
+		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
+	}
+	out := make(chan model.StreamChunk)
+	go func() {
+		defer close(out)
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		var currentEvent string
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "event:") {
+				currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				chunk, done, scanErr := parseAnthropicSSEEvent(currentEvent, strings.TrimPrefix(line, "data:"))
+				currentEvent = ""
+				if scanErr != nil {
+					out <- model.StreamChunk{Error: model.NewError(model.ErrCodeProviderError, scanErr.Error())}
+					return
+				}
+				if done {
+					out <- chunk
+					return
+				}
+				if chunk.ID != "" || chunk.Delta.Content != "" || chunk.Delta.Role != "" {
+					out <- chunk
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			out <- model.StreamChunk{Error: model.NewError(model.ErrCodeProviderError, err.Error())}
+		}
+	}()
+	return out, nil
+}
+```
+
+更新 `SendStream` 方法（替换原有 stub）：
+
+```go
+func (p *Anthropic) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	return StreamAnthropic(ctx, p.client, p.baseURL+"/v1/messages", p.apiKey, req)
+}
+```
+
+- [ ] **步骤 8：验证全部测试通过**
+
+```bash
+go test ./internal/egress -v
+```
+
+预期：全部 PASS（包含 4 个测试：2 个已有 + 2 个新增）。
+
+- [ ] **步骤 9：提交**
+
+```bash
+git add internal/egress/anthropic.go internal/egress/anthropic_test.go
+git commit -m "feat: 添加 anthropic 流式适配"
 ```
 
 ---

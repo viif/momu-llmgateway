@@ -17,15 +17,13 @@
 
 ## 支持的 Provider
 
-| Provider | API 格式 | 特殊处理 |
-|----------|---------|---------|
-| OpenAI | 原生格式 | 直接转发 |
-| Anthropic | Messages API | system 提取为顶层字段，role 映射 |
-| DeepSeek | OpenAI 兼容 | 独立 base URL + API Key |
-| 通义千问 (Qwen) | OpenAI 兼容 | DashScope API，独立 base URL |
-| 智谱 (GLM) | 独立格式 | 消息格式转换，tool_calls 处理 |
-
-**注**: DeepSeek/Qwen 复用 `OpenAICompatible` 基础适配器，仅配置不同的 base URL。
+| Provider | API 格式 | 特殊处理 / 备注 |
+| :--- | :--- | :--- |
+| OpenAI | 原生基准格式 | 网关的适配基准，直接转发。 |
+| Anthropic | 独立格式 | 需提取 `system` 为顶层字段；流式响应需解析 `event:` 事件流。 |
+| DeepSeek | OpenAI 兼容 | 仅需更换 `base_url` 和 `api_key`。 |
+| 通义千问 (Qwen) | OpenAI 兼容 | 需使用 DashScope 的兼容模式 endpoint。 |
+| 智谱 (GLM) | OpenAI 兼容 | 官方已兼容 OpenAI 接口，无需复杂的格式转换，直接复用 OpenAI 适配器即可。 |
 
 ## 架构: Clean Architecture + 接口驱动
 
@@ -57,10 +55,8 @@ momu-llmgateway/
 │   │   └── circuitbreaker.go       # 熔断器
 │   ├── egress/
 │   │   ├── adapter.go              # 适配器注册中心
-│   │   ├── openai_compat.go        # OpenAI 兼容适配器基类（OpenAI/DeepSeek/Qwen）
+│   │   ├── openai.go              # OpenAI 兼容适配器（OpenAI/DeepSeek/Qwen/GLM）
 │   │   ├── anthropic.go            # Anthropic/Claude 适配器
-│   │   ├── glm.go                  # 智谱 GLM 适配器
-│   │   └── stream.go               # SSE 流式响应处理
 │   ├── cache/
 │   │   └── semantic.go             # 语义缓存（Embedding 相似度匹配）
 │   ├── fallback/
@@ -211,11 +207,9 @@ type Provider interface {
 }
 ```
 
-**OpenAICompatible 基础适配器**: 处理 OpenAI 格式的请求/响应，可通过配置 base_url 和 api_key 复用于 OpenAI、DeepSeek、Qwen。
+**OpenAICompatible 适配器**: 处理 OpenAI 格式的请求/响应，可通过配置 base_url 和 api_key 复用于 OpenAI、DeepSeek、Qwen、GLM。GLM 已兼容 OpenAI 接口，直接配置为 `openai` 类型即可。SSE 流式解析内置在同一文件中。
 
-**Anthropic 适配器**: 将 StandardRequest 转为 Anthropic Messages API 格式（system 提取为顶层字段，assistant/user role 映射）。
-
-**GLM 适配器**: 将 StandardRequest 转为智谱独立 API 格式。
+**Anthropic 适配器**: 将 StandardRequest 转为 Anthropic Messages API 格式（system 提取为顶层字段，流式响应用独立的 `event:` / `data:` 双行 SSE 解析）。
 
 ### SSE 流式处理
 
@@ -369,7 +363,7 @@ auth:
 
 providers:
   openai:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.openai.com/v1"
     api_key: "${OPENAI_API_KEY}"
     models: ["gpt-4o", "gpt-4o-mini"]
@@ -383,21 +377,21 @@ providers:
     weight: 80
     timeout: 60s
   deepseek:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://api.deepseek.com/v1"
     api_key: "${DEEPSEEK_API_KEY}"
     models: ["deepseek-chat", "deepseek-reasoner"]
     weight: 90
     timeout: 60s
   qwen:
-    type: "openai_compat"
+    type: "openai"
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: "${QWEN_API_KEY}"
     models: ["qwen-turbo", "qwen-plus", "qwen-max"]
     weight: 85
     timeout: 60s
-  glm:
-    type: "glm"
+   glm:
+    type: "openai"
     base_url: "https://open.bigmodel.cn/api/paas/v4"
     api_key: "${GLM_API_KEY}"
     models: ["glm-4", "glm-4-flash"]
