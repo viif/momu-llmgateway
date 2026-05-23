@@ -113,3 +113,8 @@ Provider API Key 在 `configs/gateway.yaml` 中使用 `${OPENAI_API_KEY}` 等环
 - `chore`：构建、依赖、CI 等维护性改动
 - `style`：代码格式调整（不影响逻辑）
 - `docs`：文档变更
+
+## 工作流程
+
+- 每次修改代码或文件后，**暂停等待用户确认**，不自动提交
+- 只有在用户明确要求时，才执行 `git add` / `git commit` / `git push` 等操作
