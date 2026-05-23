@@ -1630,7 +1630,7 @@ import (
 )
 
 func TestCircuitBreakerOpensAfterFailures(t *testing.T) {
-	cb := NewCircuitBreaker(2, time.Second, time.Minute)
+	cb := NewCircuitBreaker(2, time.Minute)
 	require.True(t, cb.Allow())
 	cb.RecordFailure()
 	cb.RecordFailure()
@@ -1676,7 +1676,7 @@ type CircuitBreaker struct {
 	openedAt time.Time
 }
 
-func NewCircuitBreaker(threshold int, _ time.Duration, cooldown time.Duration) *CircuitBreaker {
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{threshold: threshold, cooldown: cooldown, state: StateClosed}
 }
 

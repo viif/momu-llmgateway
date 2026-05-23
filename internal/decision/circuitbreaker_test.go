@@ -8,7 +8,7 @@ import (
 )
 
 func TestCircuitBreakerOpensAfterFailures(t *testing.T) {
-	cb := NewCircuitBreaker(2, time.Second, time.Minute)
+	cb := NewCircuitBreaker(2, time.Minute)
 	require.True(t, cb.Allow())
 	cb.RecordFailure()
 	cb.RecordFailure()

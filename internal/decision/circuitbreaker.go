@@ -22,7 +22,7 @@ type CircuitBreaker struct {
 	openedAt  time.Time
 }
 
-func NewCircuitBreaker(threshold int, _ time.Duration, cooldown time.Duration) *CircuitBreaker {
+func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
 	return &CircuitBreaker{threshold: threshold, cooldown: cooldown, state: StateClosed}
 }
 
