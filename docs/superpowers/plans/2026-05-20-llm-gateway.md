@@ -101,7 +101,7 @@ go build ./...
 
 ```bash
 git add go.mod go.sum cmd internal configs .github
-git commit -m "feat: scaffold llm gateway project"
+git commit -m "feat: 搭建 llm gateway 工程骨架"
 ```
 
 ---
@@ -161,7 +161,7 @@ go test ./...
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: add github actions basic build and test workflow"
+git commit -m "ci: 添加 github actions 基础构建和测试 workflow"
 ```
 
 > **CI 逐步丰富说明：** 本任务建立 CI 基础骨架。后续每个新任务在增加代码和测试的同时，CI 也会随之验证更多内容。最终会在 CI 中逐步补充 lint 检查、竞态检测、覆盖率上报等增强步骤（参见任务 19）。
@@ -359,7 +359,7 @@ go test ./internal/model -v
 
 ```bash
 git add internal/model
-git commit -m "feat: add core gateway data models"
+git commit -m "feat: 添加核心网关数据模型"
 ```
 
 ---
@@ -693,7 +693,7 @@ go test ./internal/config -v
 
 ```bash
 git add internal/config configs/gateway.yaml
-git commit -m "feat: add viper config loading and hot reload"
+git commit -m "feat: 添加 viper 配置加载和热更新"
 ```
 
 ---
@@ -816,7 +816,7 @@ go test ./internal/observability -v
 
 ```bash
 git add go.mod go.sum internal/observability
-git commit -m "feat: add observability primitives"
+git commit -m "feat: 添加可观测性基础设施"
 ```
 
 ---
@@ -929,7 +929,7 @@ go test ./internal/egress -run TestOpenAICompatibleBuildRequest -v
 
 ```bash
 git add internal/egress/openai_compat.go internal/egress/openai_compat_test.go
-git commit -m "feat: add openai-compatible provider adapter"
+git commit -m "feat: 添加 openai 兼容 provider 适配器"
 ```
 
 ---
@@ -1045,7 +1045,7 @@ go test ./internal/egress -run TestParseSSELine -v
 
 ```bash
 git add internal/egress/stream.go internal/egress/stream_test.go
-git commit -m "feat: add sse stream conversion"
+git commit -m "feat: 添加 sse 流式转换"
 ```
 
 ---
@@ -1203,7 +1203,7 @@ go test ./internal/egress -run 'TestAnthropicExtractsSystemMessage|TestGLMBuildR
 
 ```bash
 git add internal/egress/anthropic.go internal/egress/glm.go internal/egress/*_test.go
-git commit -m "feat: add anthropic and glm adapters"
+git commit -m "feat: 添加 anthropic 和 glm 适配器"
 ```
 
 ---
@@ -1295,7 +1295,7 @@ go test ./internal/egress -run TestRegistryFindsProvidersByModel -v
 
 ```bash
 git add internal/egress/adapter.go internal/egress/adapter_test.go
-git commit -m "feat: add provider registry"
+git commit -m "feat: 添加 provider 注册表"
 ```
 
 ---
@@ -1403,7 +1403,7 @@ go test ./internal/decision -run TestCircuitBreakerOpensAfterFailures -v
 
 ```bash
 git add internal/decision/circuitbreaker.go internal/decision/circuitbreaker_test.go
-git commit -m "feat: add circuit breaker"
+git commit -m "feat: 添加熔断器"
 ```
 
 ---
@@ -1484,7 +1484,7 @@ go test ./internal/decision -run TestBalancerSelectsHighestEffectiveWeight -v
 
 ```bash
 git add internal/decision/balancer.go internal/decision/balancer_test.go
-git commit -m "feat: add weighted provider balancer"
+git commit -m "feat: 添加加权 provider 负载均衡"
 ```
 
 ---
@@ -1604,7 +1604,7 @@ go test ./internal/decision -run 'TestRouterExplicitProviderPrefix|TestRouterDef
 
 ```bash
 git add internal/decision/strategy_*.go internal/decision/router.go internal/decision/router_test.go
-git commit -m "feat: add routing strategy chain"
+git commit -m "feat: 添加路由策略链"
 ```
 
 ---
@@ -1683,7 +1683,7 @@ go test ./internal/cache -run TestCosineSimilarity -v
 
 ```bash
 git add internal/cache
-git commit -m "feat: add semantic cache primitives"
+git commit -m "feat: 添加语义缓存基础函数"
 ```
 
 ---
@@ -1754,7 +1754,7 @@ go test ./internal/fallback -run TestFallbackChain -v
 
 ```bash
 git add internal/fallback
-git commit -m "feat: add fallback engine"
+git commit -m "feat: 添加 fallback 降级引擎"
 ```
 
 ---
@@ -1875,7 +1875,7 @@ go test ./internal/ingress -run TestAuthMiddlewareAcceptsBearerKey -v
 
 ```bash
 git add internal/ingress/middleware_*.go internal/ingress/middleware_auth_test.go
-git commit -m "feat: add ingress middleware"
+git commit -m "feat: 添加接入层中间件"
 ```
 
 ---
@@ -1958,7 +1958,7 @@ go test ./internal/ingress -run TestHealthHandler -v
 
 ```bash
 git add internal/ingress/handler.go internal/ingress/handler_test.go
-git commit -m "feat: add http route handlers"
+git commit -m "feat: 添加 http 路由处理器"
 ```
 
 ---
@@ -2035,7 +2035,7 @@ go test ./...
 
 ```bash
 git add cmd/gateway/main.go
-git commit -m "feat: wire gateway server startup"
+git commit -m "feat: 组装网关服务启动流程"
 ```
 
 ---
@@ -2079,7 +2079,7 @@ docker build -t momu-llmgateway:local .
 
 ```bash
 git add Dockerfile
-git commit -m "feat: add gateway dockerfile"
+git commit -m "feat: 添加网关 dockerfile"
 ```
 
 ---
@@ -2162,7 +2162,7 @@ PY
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: add lint, race detection and coverage upload"
+git commit -m "ci: 添加 lint、竞态检测和覆盖率上报"
 ```
 
 ---
@@ -2221,7 +2221,7 @@ curl -i -X POST http://localhost:8080/v1/chat/completions \
 
 ```bash
 git add <changed-files>
-git commit -m "fix: complete gateway end-to-end verification"
+git commit -m "fix: 完成网关端到端验证"
 ```
 
 如果没有代码变更，不创建空提交。
