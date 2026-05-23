@@ -12,7 +12,8 @@
 - [x] 任务 1：初始化 Go 工程骨架 — `go.mod`、目录结构、最小入口 `cmd/gateway/main.go`
 - [x] 任务 2：添加 GitHub Actions CI（基础版本）
 - [x] 任务 3：定义核心数据模型 — `internal/model/request.go`、`provider.go`、`errors.go`
-- [ ] 任务 4-20：待依次执行
+- [x] 任务 4：实现配置加载、环境变量展开和原子热更新 — `internal/config/config.go`、`configs/gateway.yaml`
+- [ ] 任务 5-20：待依次执行
 
 ### 实现约束
 

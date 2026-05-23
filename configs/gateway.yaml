@@ -1,0 +1,82 @@
+server:
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 120s
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+auth:
+  api_keys:
+    - key: "sk-xxx"
+      name: "default"
+      rate_limit: 60
+      allowed_models: ["*"]
+providers:
+  openai:
+    type: "openai_compat"
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    models: ["gpt-4o", "gpt-4o-mini"]
+    weight: 100
+    timeout: 60s
+  anthropic:
+    type: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+    models: ["claude-sonnet-4-20250514"]
+    weight: 80
+    timeout: 60s
+  deepseek:
+    type: "openai_compat"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "${DEEPSEEK_API_KEY}"
+    models: ["deepseek-chat", "deepseek-reasoner"]
+    weight: 90
+    timeout: 60s
+  qwen:
+    type: "openai_compat"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: "${QWEN_API_KEY}"
+    models: ["qwen-turbo", "qwen-plus", "qwen-max"]
+    weight: 85
+    timeout: 60s
+  glm:
+    type: "glm"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    api_key: "${GLM_API_KEY}"
+    models: ["glm-4", "glm-4-flash"]
+    weight: 75
+    timeout: 60s
+routing:
+  strategies: ["explicit", "semantic", "capability", "cost_cascade"]
+  rules:
+    - task_type: "long_context"
+      condition: "input_tokens > 100000"
+      target_models: ["claude-sonnet-4-20250514", "deepseek-chat"]
+  cascade:
+    default: ["deepseek-chat", "gpt-4o-mini", "gpt-4o"]
+semantic_routing:
+  embedding_provider: "openai"
+  embedding_model: "text-embedding-3-small"
+  similarity_threshold: 0.75
+  categories:
+    - name: "code_generation"
+      target_models: ["deepseek-chat", "gpt-4o"]
+      exemplars: ["Write a Python function that...", "Generate code to...", "帮我写一个..."]
+semantic_cache:
+  enabled: true
+  similarity_threshold: 0.95
+  ttl: 1h
+  max_entries: 10000
+  embedding_provider: "openai"
+  embedding_model: "text-embedding-3-small"
+fallback:
+  retry_max: 2
+  retry_backoff: "1s"
+  chains:
+    gpt-4o: ["claude-sonnet-4-20250514", "gpt-4o-mini"]
+circuit_breaker:
+  failure_threshold: 5
+  window: 10s
+  cooldown: 30s
