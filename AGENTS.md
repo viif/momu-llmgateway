@@ -2,12 +2,21 @@
 
 ## 项目状态
 
-当前仓库仍处于 design-first 阶段，尚未实现 Go 代码。主要依据是：
+仓库已进入实现阶段。设计文档和分步实施计划：
 
 - `docs/superpowers/specs/2026-05-20-llm-gateway-design.md` — 产品与架构设计文档
-- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划
+- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（15 个任务、按 TDD 逐项实施）
 
-开始实现时，默认按 plan 文档逐项执行；除非用户明确要求，先不要偏离或重写计划。
+### 实施进度
+
+- [x] 任务 1：初始化 Go 工程骨架 — `go.mod`、目录结构、最小入口 `cmd/gateway/main.go`
+- [ ] 任务 2-15：待依次执行
+
+### 实现约束
+
+- 严格按 plan 文档逐项执行，不偏离或重写计划
+- 每个任务遵循 TDD 流程：先写测试 → 确认失败 → 最小实现 → 确认通过
+- 每项任务完成后提交，不跨任务混合提交
 
 ## 计划中的开发命令
 
@@ -91,7 +100,9 @@ Provider API Key 在 `configs/gateway.yaml` 中使用 `${OPENAI_API_KEY}` 等环
 
 ## Git 提交规范
 
-提交信息格式：`type: description`，使用中文书写提交信息
+**重要：必须使用中文书写提交信息。**
+
+提交信息格式：`type: 中文描述`（type 用小写英文，描述必须用中文）
 
 常用 type：
 - `feat`：新功能
