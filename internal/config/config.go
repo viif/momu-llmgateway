@@ -21,8 +21,9 @@ type Config struct {
 	SemanticRouting SemanticRoutingConfig     `mapstructure:"semantic_routing"`
 	SemanticCache   SemanticCacheConfig       `mapstructure:"semantic_cache"`
 	Fallback        FallbackConfig            `mapstructure:"fallback"`
-	CircuitBreaker  CircuitBreakerConfig  `mapstructure:"circuit_breaker"`
-	Balancer        BalancerConfig        `mapstructure:"balancer"`
+	CircuitBreaker  CircuitBreakerConfig      `mapstructure:"circuit_breaker"`
+	Balancer        BalancerConfig            `mapstructure:"balancer"`
+	Embedding       EmbeddingConfig           `mapstructure:"embedding"`
 }
 
 type ServerConfig struct {
@@ -70,8 +71,6 @@ type RoutingRuleConfig struct {
 }
 
 type SemanticRoutingConfig struct {
-	EmbeddingProvider   string                   `mapstructure:"embedding_provider"`
-	EmbeddingModel      string                   `mapstructure:"embedding_model"`
 	SimilarityThreshold float64                  `mapstructure:"similarity_threshold"`
 	Categories          []SemanticCategoryConfig `mapstructure:"categories"`
 }
@@ -87,8 +86,6 @@ type SemanticCacheConfig struct {
 	SimilarityThreshold float64       `mapstructure:"similarity_threshold"`
 	TTL                 time.Duration `mapstructure:"ttl"`
 	MaxEntries          int           `mapstructure:"max_entries"`
-	EmbeddingProvider   string        `mapstructure:"embedding_provider"`
-	EmbeddingModel      string        `mapstructure:"embedding_model"`
 }
 
 type FallbackConfig struct {
@@ -110,6 +107,11 @@ type BalancerConfig struct {
 	WarmupDuration                time.Duration `mapstructure:"warmup_duration"`
 	HealthWindowSize              time.Duration `mapstructure:"health_window_size"`
 	HealthMinRequests             int           `mapstructure:"health_min_requests"`
+}
+
+type EmbeddingConfig struct {
+	OnnxLibraryPath string `mapstructure:"onnx_library_path"`
+	ModelPath       string `mapstructure:"model_path"`
 }
 
 func Load(path string) (*Config, error) {

@@ -57,8 +57,6 @@ routing:
   cascade:
     default: ["deepseek-chat", "gpt-4o-mini", "gpt-4o"]
 semantic_routing:
-  embedding_provider: "openai"
-  embedding_model: "text-embedding-3-small"
   similarity_threshold: 0.75
   categories:
     - name: "code_generation"
@@ -69,8 +67,6 @@ semantic_cache:
   similarity_threshold: 0.95
   ttl: 1h
   max_entries: 10000
-  embedding_provider: "openai"
-  embedding_model: "text-embedding-3-small"
 fallback:
   retry_max: 2
   retry_backoff: "1s"
@@ -87,3 +83,6 @@ balancer:
   warmup_duration: 30s
   health_window_size: 30s
   health_min_requests: 10
+embedding:
+  onnx_library_path: "/usr/lib/libonnxruntime.so"
+  model_path: "./.models/bge-small-zh-v1.5"
