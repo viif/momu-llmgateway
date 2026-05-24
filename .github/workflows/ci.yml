@@ -20,7 +20,8 @@ jobs:
         uses: golangci/golangci-lint-action@v4
         with:
           version: v2.6.2
-          args: --go=1.25
+          args: --go=1.25 --print-issued-lines=false --print-linter-name=false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   test:
     runs-on: ubuntu-latest
