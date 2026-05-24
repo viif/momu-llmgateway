@@ -56,7 +56,7 @@ func (p *Anthropic) Send(ctx context.Context, req *model.StandardRequest) (*mode
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
 	}
@@ -172,13 +172,13 @@ func StreamAnthropic(ctx context.Context, client *http.Client, url, apiKey strin
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
 	}
 	out := make(chan model.StreamChunk)
 	go func() {
 		defer close(out)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		scanner := bufio.NewScanner(resp.Body)
 		var currentEvent string
 		for scanner.Scan() {

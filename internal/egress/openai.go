@@ -47,7 +47,7 @@ func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
 		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
 	}
@@ -107,13 +107,13 @@ func streamOpenAI(ctx context.Context, client *http.Client, url, apiKey string, 
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
 	}
 	out := make(chan model.StreamChunk)
 	go func() {
 		defer close(out)
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			chunk, done, scanErr := parseSSELine(scanner.Text())

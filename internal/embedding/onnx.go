@@ -96,26 +96,26 @@ func (o *onnxConcrete) embed(texts []string) ([][]float64, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create input_ids tensor: %w", err)
 	}
-	defer inputTensor.Destroy()
+	defer func() { _ = inputTensor.Destroy() }()
 
 	maskTensor, err := ort.NewTensor(inputShape, attnMask)
 	if err != nil {
 		return nil, fmt.Errorf("create attention_mask tensor: %w", err)
 	}
-	defer maskTensor.Destroy()
+	defer func() { _ = maskTensor.Destroy() }()
 
 	typeTensor, err := ort.NewTensor(inputShape, typeIDs)
 	if err != nil {
 		return nil, fmt.Errorf("create token_type_ids tensor: %w", err)
 	}
-	defer typeTensor.Destroy()
+	defer func() { _ = typeTensor.Destroy() }()
 
 	outputShape := ort.NewShape(batchSize, defaultMaxLength, defaultEmbeddingDim)
 	outputTensor, err := ort.NewEmptyTensor[float32](outputShape)
 	if err != nil {
 		return nil, fmt.Errorf("create output tensor: %w", err)
 	}
-	defer outputTensor.Destroy()
+	defer func() { _ = outputTensor.Destroy() }()
 
 	inputs := []ort.Value{inputTensor, maskTensor, typeTensor}
 	outputs := []ort.Value{outputTensor}
@@ -138,7 +138,7 @@ func (o *onnxConcrete) embed(texts []string) ([][]float64, error) {
 
 func (o *onnxConcrete) close() {
 	if o.session != nil {
-		o.session.Destroy()
+		_ = o.session.Destroy()
 	}
 }
 
