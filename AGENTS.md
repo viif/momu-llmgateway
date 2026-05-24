@@ -20,7 +20,7 @@
 - [x] 任务 9：实现 Provider 注册表 — `internal/egress/adapter.go`、`adapter_test.go`
 - [x] 任务 10：实现熔断器 — `internal/decision/circuitbreaker.go`、`circuitbreaker_test.go`
 - [x] 任务 11：实现加权负载均衡 — `internal/decision/balancer.go`、`balancer_test.go`
-- [ ] 任务 12-20：待依次执行
+- [ ] 任务 12-21：待依次执行
 
 ### 实现约束
 

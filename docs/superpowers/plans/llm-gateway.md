@@ -30,13 +30,16 @@
 - `internal/decision/strategy_semantic.go`：基于 Embedding 相似度的语义路由。
 - `internal/decision/router.go`：策略链编排、显式路由和默认路由。
 - `internal/cache/semantic.go`：语义缓存查询、写入、TTL 和命中判断。
+- `internal/embedding/embedding.go`：纯函数（CosineSimilarity / NormalizeVector / MeanPooling）。
+- `internal/embedding/engine.go`：`EmbeddingEngine` 类型和单例生命周期管理。
+- `internal/embedding/onnx.go`：ONNX 嵌入引擎实现（`onnxruntime_go` + 纯 Go tokenizer `hftokenizer`），提供 `Init()` / `Embed()` / `Close()`。
 - `internal/fallback/engine.go`：L1 重试、L2 跨 Provider、L3 跨模型、L4 兜底响应。
 - `internal/ingress/middleware_auth.go`：Bearer API Key 认证和 allowed_models 校验。
 - `internal/ingress/middleware_ratelimit.go`：Redis 滑动窗口限流。
 - `internal/ingress/middleware_logging.go`：请求日志和延迟记录。
 - `internal/ingress/handler.go`：`POST /v1/chat/completions`、`GET /health`、`GET /metrics`。
 - `configs/gateway.yaml`：默认配置样例。
-- `.github/workflows/ci.yml`：GitHub Actions lint/test/coverage，不包含 镜像构建 job。
+- `.github/workflows/ci.yml`：GitHub Actions lint/test，不包含镜像构建 job。
 - `Dockerfile`：服务镜像构建文件，供手动或后续发布流程使用。
 
 ---
@@ -53,7 +56,7 @@
 - [ ] **步骤 1：创建目录结构**
 
 ```bash
-mkdir -p cmd/gateway internal/{config,model,ingress,decision,egress,cache,fallback,observability} configs .github/workflows
+mkdir -p cmd/gateway internal/{config,model,ingress,decision,egress,cache,embedding,fallback,observability} configs .github/workflows
 ```
 
 预期：目录创建成功，无输出或无错误。
@@ -465,6 +468,7 @@ type Config struct {
 	Fallback        FallbackConfig        `mapstructure:"fallback"`
 	CircuitBreaker  CircuitBreakerConfig  `mapstructure:"circuit_breaker"`
 	Balancer        BalancerConfig        `mapstructure:"balancer"`
+	Embedding       EmbeddingConfig       `mapstructure:"embedding"`
 }
 
 type ServerConfig struct {
@@ -512,8 +516,6 @@ type RoutingRuleConfig struct {
 }
 
 type SemanticRoutingConfig struct {
-	EmbeddingProvider   string                   `mapstructure:"embedding_provider"`
-	EmbeddingModel      string                   `mapstructure:"embedding_model"`
 	SimilarityThreshold float64                  `mapstructure:"similarity_threshold"`
 	Categories          []SemanticCategoryConfig `mapstructure:"categories"`
 }
@@ -529,8 +531,6 @@ type SemanticCacheConfig struct {
 	SimilarityThreshold float64       `mapstructure:"similarity_threshold"`
 	TTL                 time.Duration `mapstructure:"ttl"`
 	MaxEntries          int           `mapstructure:"max_entries"`
-	EmbeddingProvider   string        `mapstructure:"embedding_provider"`
-	EmbeddingModel      string        `mapstructure:"embedding_model"`
 }
 
 type FallbackConfig struct {
@@ -552,6 +552,11 @@ type BalancerConfig struct {
 	WarmupDuration                time.Duration `mapstructure:"warmup_duration"`
 	HealthWindowSize              time.Duration `mapstructure:"health_window_size"`
 	HealthMinRequests             int           `mapstructure:"health_min_requests"`
+}
+
+type EmbeddingConfig struct {
+	OnnxLibraryPath string `mapstructure:"onnx_library_path"`
+	ModelPath       string `mapstructure:"model_path"`
 }
 
 func Load(path string) (*Config, error) {
@@ -664,8 +669,6 @@ routing:
   cascade:
     default: ["deepseek-chat", "gpt-4o-mini", "gpt-4o"]
 semantic_routing:
-  embedding_provider: "openai"
-  embedding_model: "text-embedding-3-small"
   similarity_threshold: 0.75
   categories:
     - name: "code_generation"
@@ -676,8 +679,6 @@ semantic_cache:
   similarity_threshold: 0.95
   ttl: 1h
   max_entries: 10000
-  embedding_provider: "openai"
-  embedding_model: "text-embedding-3-small"
 fallback:
   retry_max: 2
   retry_backoff: "1s"
@@ -687,6 +688,16 @@ circuit_breaker:
   failure_threshold: 5
   window: 10s
   cooldown: 30s
+balancer:
+  concurrency_penalty_coefficient: 3.0
+  latency_penalty_coefficient: 2.0
+  warmup_enabled: true
+  warmup_duration: 30s
+  health_window_size: 30s
+  health_min_requests: 10
+embedding:
+  onnx_library_path: "/usr/lib/libonnxruntime.so"
+  model_path: "./.models/bge-small-zh-v1.5"
 ```
 
 - [ ] **步骤 5：验证测试通过**
@@ -2031,7 +2042,391 @@ git commit -m "feat: 实现平滑动态加权负载均衡（SWRR）"
 
 ---
 
-## 任务 12：实现路由策略链
+## 任务 12：实现本地嵌入引擎
+
+**文件：**
+- 新建： `internal/embedding/embedding.go`
+- 新建： `internal/embedding/engine.go`
+- 新建： `internal/embedding/onnx.go`
+- 新建： `internal/embedding/embedding_test.go`
+- 新建： `internal/embedding/onnx_integration_test.go`
+
+说明：使用 `github.com/yalue/onnxruntime_go@v1.30.1` 加载 ONNX 模型 + `github.com/gomlx/go-huggingface/tokenizers/hftokenizer`（纯 Go）加载 BGE tokenizer，为语义路由和语义缓存提供本地 512 维向量化服务。引擎采用单例模式（`sync.Once`），启动时加载 tokenizer 和 ONNX session 并常驻内存。模型文件存放于 `.models/bge-small-zh-v1.5/`，由 `.gitignore` 忽略。CI 中通过 HuggingFace 下载模型并设置 `EMBEDDING_MODEL_PATH`。
+
+### 依赖
+
+```bash
+go get github.com/yalue/onnxruntime_go@v1.30.1
+go get github.com/gomlx/go-huggingface@v0.3.5
+```
+
+### BGE 模型
+
+从 `onnx-community/bge-small-zh-v1.5-ONNX` 下载以下文件至 `.models/bge-small-zh-v1.5/`：
+
+| 文件 | 用途 |
+|---|---|
+| `model.onnx` + `model.onnx_data` | ONNX 模型（外部数据格式） |
+| `tokenizer.json` | HuggingFace 分词配置 |
+| `tokenizer_config.json` | 特殊 token / 参数配置 |
+
+模型输入 (`int64`)：`input_ids [batch, 512]`、`attention_mask [batch, 512]`、`token_type_ids [batch, 512]`。
+输出：`last_hidden_state [batch, 512, 512]` float32 → mean pooling → L2 归一化 → `[batch, 512]` float64。
+
+### 测试
+
+| 文件 | 内容 |
+|---|---|
+| `embedding_test.go` | `TestCosineSimilarity` / `TestNormalizeVector` / `TestMeanPooling`（纯函数，3 项） |
+| `onnx_integration_test.go` | `TestONNXEmbedding` — 真实加载 ONNX 模型推理，验证 512 维输出 + L2 归一化 |
+
+`TestONNXEmbedding` 通过 `EMBEDDING_MODEL_PATH` 和 `ONNXRUNTIME_LIB_PATH` 环境变量或内置默认路径定位模型和共享库。
+
+### CI 配置
+
+`.github/workflows/ci.yml` 的 test job 中：
+
+1. **安装 ONNX Runtime**：下载 v1.25.0 预编译 `.so` 至 `/usr/local/lib/`，设置 `ONNXRUNTIME_LIB_PATH`
+2. **下载 BGE 模型**：从 HuggingFace 下载 4 个文件至 `.models/bge-small-zh-v1.5/`，设置 `EMBEDDING_MODEL_PATH`
+3. **运行全量测试**：`go test -race ./...`（28 个测试，含 ONNX 集成测试）
+
+- [x] **步骤 1：添加依赖**
+
+```bash
+go get github.com/yalue/onnxruntime_go@v1.30.1
+go get github.com/gomlx/go-huggingface@v0.3.5
+go mod tidy
+```
+
+- [x] **步骤 2：实现纯函数并写测试**
+
+文件： `internal/embedding/embedding.go`
+
+```go
+package embedding
+
+import "math"
+
+func CosineSimilarity(a, b []float64) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+func NormalizeVector(v []float64) []float64 {
+	var norm float64
+	for _, x := range v {
+		norm += x * x
+	}
+	norm = math.Sqrt(norm)
+	if norm == 0 {
+		return v
+	}
+	out := make([]float64, len(v))
+	for i, x := range v {
+		out[i] = x / norm
+	}
+	return out
+}
+
+func MeanPooling(hidden [][][]float32, mask [][]int64) [][]float64 {
+	batch := len(hidden)
+	if batch == 0 {
+		return nil
+	}
+	dim := len(hidden[0][0])
+	result := make([][]float64, batch)
+	for b := 0; b < batch; b++ {
+		vec := make([]float64, dim)
+		var sum float64
+		for s := 0; s < len(hidden[b]); s++ {
+			weight := float64(mask[b][s])
+			sum += weight
+			for d := 0; d < dim; d++ {
+				vec[d] += float64(hidden[b][s][d]) * weight
+			}
+		}
+		if sum > 0 {
+			for d := 0; d < dim; d++ {
+				vec[d] /= sum
+			}
+		}
+		result[b] = vec
+	}
+	return result
+}
+```
+
+文件： `internal/embedding/embedding_test.go`
+
+```go
+package embedding
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestCosineSimilarity(t *testing.T) {
+	require.InDelta(t, 1.0, CosineSimilarity([]float64{1, 0}, []float64{1, 0}), 0.0001)
+	require.InDelta(t, 0.0, CosineSimilarity([]float64{1, 0}, []float64{0, 1}), 0.0001)
+	require.InDelta(t, 0.0, CosineSimilarity(nil, []float64{1, 0}), 0.0001)
+}
+
+func TestNormalizeVector(t *testing.T) {
+	v := NormalizeVector([]float64{3, 4})
+	require.InDelta(t, 0.6, v[0], 0.0001)
+	require.InDelta(t, 0.8, v[1], 0.0001)
+
+	zero := []float64{0, 0}
+	require.Equal(t, zero, NormalizeVector(zero))
+}
+
+func TestMeanPooling(t *testing.T) {
+	lastHidden := [][][]float32{
+		{
+			{1.0, 2.0, 3.0},
+			{4.0, 5.0, 6.0},
+			{7.0, 8.0, 9.0},
+		},
+	}
+	mask := [][]int64{{1, 1, 0}}
+	result := MeanPooling(lastHidden, mask)
+	require.Len(t, result, 1)
+	require.Len(t, result[0], 3)
+	require.InDelta(t, 2.5, result[0][0], 0.001)
+	require.InDelta(t, 3.5, result[0][1], 0.001)
+	require.InDelta(t, 4.5, result[0][2], 0.001)
+}
+```
+
+- [x] **步骤 3：实现引擎类型定义**
+
+文件： `internal/embedding/engine.go`
+
+```go
+package embedding
+
+import "sync"
+
+type EmbeddingEngine struct {
+	mu           sync.Mutex
+	maxLength    int64
+	embeddingDim int64
+	onnxImpl     interface {
+		embed(texts []string) ([][]float64, error)
+		close()
+	}
+}
+
+var (
+	once    sync.Once
+	engine  *EmbeddingEngine
+	initErr error
+)
+
+const (
+	defaultMaxLength    = 512
+	defaultEmbeddingDim = 512
+)
+
+func Instance() *EmbeddingEngine {
+	return engine
+}
+
+func (e *EmbeddingEngine) Close() {
+	if e.onnxImpl != nil {
+		e.onnxImpl.close()
+	}
+}
+```
+
+- [x] **步骤 4：实现 ONNX 嵌入引擎主体**
+
+文件： `internal/embedding/onnx.go`
+
+```go
+package embedding
+
+import (
+	"fmt"
+	"os"
+
+	ort "github.com/yalue/onnxruntime_go"
+	"github.com/gomlx/go-huggingface/tokenizers/api"
+	"github.com/gomlx/go-huggingface/tokenizers/hftokenizer"
+)
+
+type onnxConcrete struct {
+	tokenizer *hftokenizer.Tokenizer
+	session   *ort.DynamicAdvancedSession
+}
+
+func Init(libPath, modelPath string) error {
+	once.Do(func() {
+		ort.SetSharedLibraryPath(libPath)
+		if err := ort.InitializeEnvironment(); err != nil {
+			initErr = fmt.Errorf("init onnx env: %w", err)
+			return
+		}
+		configData, err := os.ReadFile(modelPath + "/tokenizer_config.json")
+		if err != nil {
+			initErr = fmt.Errorf("read tokenizer_config.json: %w", err)
+			return
+		}
+		config, err := api.ParseConfigContent(configData)
+		if err != nil {
+			initErr = fmt.Errorf("parse tokenizer config: %w", err)
+			return
+		}
+		tk, err := hftokenizer.NewFromFile(config, modelPath+"/tokenizer.json")
+		if err != nil {
+			initErr = fmt.Errorf("load tokenizer: %w", err)
+			return
+		}
+		session, err := ort.NewDynamicAdvancedSession(
+			modelPath+"/model.onnx",
+			[]string{"input_ids", "attention_mask", "token_type_ids"},
+			[]string{"last_hidden_state"},
+			nil,
+		)
+		if err != nil {
+			initErr = fmt.Errorf("load onnx session: %w", err)
+			return
+		}
+		engine = &EmbeddingEngine{
+			onnxImpl: &onnxConcrete{tokenizer: tk, session: session},
+			maxLength: defaultMaxLength, embeddingDim: defaultEmbeddingDim,
+		}
+	})
+	return initErr
+}
+
+func (e *EmbeddingEngine) Embed(texts []string) ([][]float64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.onnxImpl == nil {
+		return nil, fmt.Errorf("onnx engine not initialized")
+	}
+	return e.onnxImpl.embed(texts)
+}
+```
+
+（完整实现含 `onnxConcrete.embed()` 中的 tokenize → 构造 tensor → `session.Run()` → mean pooling → L2 normalize 流水线，详见源码。）
+
+- [x] **步骤 5：写 ONNX 集成测试**
+
+文件： `internal/embedding/onnx_integration_test.go`
+
+```go
+package embedding
+
+import (
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestONNXEmbedding(t *testing.T) {
+	modelPath := os.Getenv("EMBEDDING_MODEL_PATH")
+	if modelPath == "" {
+		modelPath = "../../.models/bge-small-zh-v1.5"
+	}
+	libPath := os.Getenv("ONNXRUNTIME_LIB_PATH")
+	if libPath == "" {
+		libPath = "/usr/local/lib/libonnxruntime.so.1.25.0"
+	}
+
+	err := Init(libPath, modelPath)
+	require.NoError(t, err)
+	defer func() {
+		if e := Instance(); e != nil {
+			e.Close()
+		}
+	}()
+
+	vecs, err := Instance().Embed([]string{"你好世界", "Hello world"})
+	require.NoError(t, err)
+	require.Len(t, vecs, 2)
+	require.Len(t, vecs[0], 512)
+
+	norm := 0.0
+	for _, v := range vecs[0] {
+		norm += v * v
+	}
+	require.InDelta(t, 1.0, norm, 0.01)
+}
+```
+
+- [x] **步骤 6：更新 CI 配置**
+
+`.github/workflows/ci.yml` 新增：
+
+```yaml
+- name: Install ONNX Runtime
+  run: |
+    ONNX_VERSION="1.25.0"
+    ONNX_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz"
+    curl -sL "$ONNX_URL" -o onnxruntime.tgz
+    tar xzf onnxruntime.tgz
+    sudo cp onnxruntime-linux-x64-*/lib/libonnxruntime.so* /usr/local/lib/
+    sudo ldconfig
+    echo "ONNXRUNTIME_LIB_PATH=/usr/local/lib/libonnxruntime.so.${ONNX_VERSION}" >> $GITHUB_ENV
+
+- name: Download BGE Model
+  run: |
+    MODEL_DIR="./.models/bge-small-zh-v1.5"
+    HF_BASE="https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/resolve/main"
+    mkdir -p "$MODEL_DIR"
+    curl -sL "$HF_BASE/onnx/model.onnx" -o "$MODEL_DIR/model.onnx"
+    curl -sL "$HF_BASE/onnx/model.onnx_data" -o "$MODEL_DIR/model.onnx_data"
+    curl -sL "$HF_BASE/tokenizer.json" -o "$MODEL_DIR/tokenizer.json"
+    curl -sL "$HF_BASE/tokenizer_config.json" -o "$MODEL_DIR/tokenizer_config.json"
+    echo "EMBEDDING_MODEL_PATH=$MODEL_DIR" >> $GITHUB_ENV
+```
+
+- [x] **步骤 7：验证全量测试通过**
+
+```bash
+go test -race ./...
+```
+
+预期：28 个测试全部 PASS（含 TestONNXEmbedding）。
+
+- [x] **步骤 8：提交**
+
+```bash
+git add go.mod go.sum internal/embedding .gitignore .github/workflows/ci.yml configs/gateway.yaml internal/config/config.go
+git commit -m "feat: 实现本地 onnx 嵌入引擎"
+```
+
+### 配置项
+
+`configs/gateway.yaml` 新增：
+
+```yaml
+embedding:
+  onnx_library_path: "/usr/lib/libonnxruntime.so"
+  model_path: "./.models/bge-small-zh-v1.5"
+```
+
+`Config` 结构体新增 `Embedding EmbeddingConfig`，`EmbeddingConfig` 含 `OnnxLibraryPath` 和 `ModelPath`。`SemanticRoutingConfig` 和 `SemanticCacheConfig` 不再包含 `embedding_provider` / `embedding_model` 字段。
+
+---
+
+## 任务 13：实现路由策略链
 
 **文件：**
 - 新建： `internal/decision/strategy_capability.go`
@@ -2040,7 +2435,7 @@ git commit -m "feat: 实现平滑动态加权负载均衡（SWRR）"
 - 新建： `internal/decision/router.go`
 - 新建： `internal/decision/router_test.go`
 
-说明：路由策略链按优先级执行（显式路由 → 语义路由 → 能力路由 → 成本级联 → 默认路由）。决策出模型后，通过 `Balancer` 在同模型多 Provider 间进行负载均衡选择。
+说明：路由策略链按优先级执行（显式路由 → 语义路由 → 能力路由 → 成本级联 → 默认路由）。决策出模型后，通过 `Balancer` 在同模型多 Provider 间进行负载均衡选择。语义路由的嵌入向量化依赖 `internal/embedding/onnx.go` 提供的本地 ONNX 嵌入引擎。
 
 - [ ] **步骤 1：先写显式路由和默认路由测试**
 
@@ -2199,11 +2594,13 @@ git commit -m "feat: 添加路由策略链"
 
 ---
 
-## 任务 13：实现语义缓存
+## 任务 14：实现语义缓存
 
 **文件：**
 - 新建： `internal/cache/semantic.go`
 - 新建： `internal/cache/semantic_test.go`
+
+说明：语义缓存的请求嵌入向量化依赖 `internal/embedding/onnx.go` 提供的本地 ONNX 嵌入引擎。
 
 - [ ] **步骤 1：先写余弦相似度测试**
 
@@ -2278,7 +2675,7 @@ git commit -m "feat: 添加语义缓存基础函数"
 
 ---
 
-## 任务 14：实现 Fallback 引擎
+## 任务 15：实现 Fallback 引擎
 
 **文件：**
 - 新建： `internal/fallback/engine.go`
@@ -2349,7 +2746,7 @@ git commit -m "feat: 添加 fallback 降级引擎"
 
 ---
 
-## 任务 15：实现认证、限流和日志中间件
+## 任务 16：实现认证、限流和日志中间件
 
 **文件：**
 - 新建： `internal/ingress/middleware_auth.go`
@@ -2470,7 +2867,7 @@ git commit -m "feat: 添加接入层中间件"
 
 ---
 
-## 任务 16：实现 HTTP Handler
+## 任务 17：实现 HTTP Handler
 
 **文件：**
 - 新建： `internal/ingress/handler.go`
@@ -2553,7 +2950,7 @@ git commit -m "feat: 添加 http 路由处理器"
 
 ---
 
-## 任务 17：在 main.go 中组装服务
+## 任务 18：在 main.go 中组装服务
 
 **文件：**
 - 修改： `cmd/gateway/main.go`
@@ -2630,7 +3027,7 @@ git commit -m "feat: 组装网关服务启动流程"
 
 ---
 
-## 任务 18：添加 Dockerfile
+## 任务 19：添加 Dockerfile
 
 **文件：**
 - 新建： `Dockerfile`
@@ -2674,9 +3071,9 @@ git commit -m "feat: 添加网关 dockerfile"
 
 ---
 
-## 任务 19：完善 GitHub Actions CI（加入 lint、竞态检测、覆盖率上报）
+## 任务 20：完善 GitHub Actions CI（加入 lint、竞态检测、ONNX 支持）
 
-> 任务 2 已建立基础 CI（build + test），本任务在其基础上增加 lint 检查、竞态检测（`-race`）和覆盖率上报步骤。
+> 任务 2 已建立基础 CI（build + test），本任务在其基础上增加 lint 检查、竞态检测（`-race`）、ONNX Runtime 共享库安装和 `-tags onnx` 构建测试。
 
 **文件：**
 - 修改： `.github/workflows/ci.yml`
@@ -2721,10 +3118,24 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+      - name: Install ONNX Runtime
+        run: |
+          ONNX_VERSION="1.21.0"
+          ONNX_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz"
+          curl -sL "$ONNX_URL" -o onnxruntime.tgz
+          tar xzf onnxruntime.tgz
+          sudo cp onnxruntime-linux-x64-*/lib/libonnxruntime.so* /usr/local/lib/
+          sudo ldconfig
+          echo "ONNXRUNTIME_LIB_PATH=/usr/local/lib/libonnxruntime.so.${ONNX_VERSION}" >> $GITHUB_ENV
+
+      - name: Build (with ONNX)
+        run: go build -tags onnx ./...
+
       - name: Run tests
-        run: go test -race -coverprofile=coverage.out ./...
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
+        run: go test -race ./...
+
+      - name: Test ONNX embedding
+        run: go test -tags onnx -race -v ./internal/embedding/...
 ```
 
 - [ ] **步骤 2：验证 YAML 可解析**
@@ -2752,12 +3163,12 @@ PY
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: 添加 lint、竞态检测和覆盖率上报"
+git commit -m "ci: 添加 lint、竞态检测和 onnx 支持"
 ```
 
 ---
 
-## 任务 20：端到端手动验证
+## 任务 21：端到端手动验证
 
 **文件：**
 - 修改： none
@@ -2828,19 +3239,20 @@ git commit -m "fix: 完成网关端到端验证"
       -> 任务 5 可观测性
       -> 任务 6 OpenAI 兼容适配器
           -> 任务 7 SSE 流式转换
-          -> 任务 8 Anthropic/GLM 适配器
+          -> 任务 8 Anthropic 适配器
           -> 任务 9 Provider 注册表
-      -> 任务 10 熔断器
-      -> 任务 11 负载均衡
-      -> 任务 12 路由策略
-      -> 任务 13 语义缓存
-      -> 任务 14 Fallback
-      -> 任务 15 中间件
-      -> 任务 16 Handler
-          -> 任务 17 main.go 组装
-              -> 任务 18 Dockerfile
-              -> 任务 19 完善 CI
-              -> 任务 20 端到端验证
+       -> 任务 10 熔断器
+       -> 任务 11 负载均衡
+       -> 任务 12 嵌入引擎
+       -> 任务 13 路由策略
+       -> 任务 14 语义缓存
+       -> 任务 15 Fallback
+       -> 任务 16 中间件
+       -> 任务 17 Handler
+           -> 任务 18 main.go 组装
+               -> 任务 19 Dockerfile
+               -> 任务 20 完善 CI
+               -> 任务 21 端到端验证
 ```
 
 ## 自检结果
