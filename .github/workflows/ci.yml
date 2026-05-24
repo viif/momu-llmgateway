@@ -20,6 +20,7 @@ jobs:
         uses: golangci/golangci-lint-action@v4
         with:
           version: latest
+          args: --go=1.24
 
   test:
     runs-on: ubuntu-latest
@@ -46,7 +47,7 @@ jobs:
 
       - name: Download BGE Model
         run: |
-          MODEL_DIR="./.models/bge-small-zh-v1.5"
+          MODEL_DIR="${GITHUB_WORKSPACE}/.models/bge-small-zh-v1.5"
           ONNX_DIR="$MODEL_DIR"
           HF_BASE="https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/resolve/main"
           mkdir -p "$ONNX_DIR"
