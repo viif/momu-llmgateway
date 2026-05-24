@@ -2429,17 +2429,70 @@ embedding:
 ## 任务 13：实现路由策略链
 
 **文件：**
-- 新建： `internal/decision/strategy_capability.go`
-- 新建： `internal/decision/strategy_cost.go`
 - 新建： `internal/decision/strategy_semantic.go`
+- 新建： `internal/decision/strategy_semantic_test.go`
+- 新建： `internal/decision/strategy_capability.go`
+- 新建： `internal/decision/strategy_capability_test.go`
+- 新建： `internal/decision/strategy_cost.go`
+- 新建： `internal/decision/strategy_cost_test.go`
 - 新建： `internal/decision/router.go`
 - 新建： `internal/decision/router_test.go`
+- 修改： `internal/embedding/engine.go`（暴露 mock 注入点）
 
-说明：路由策略链按优先级执行（显式路由 → 语义路由 → 能力路由 → 成本级联 → 默认路由）。决策出模型后，通过 `Balancer` 在同模型多 Provider 间进行负载均衡选择。语义路由的嵌入向量化依赖 `internal/embedding/onnx.go` 提供的本地 ONNX 嵌入引擎。
+### 架构说明
 
-- [ ] **步骤 1：先写显式路由和默认路由测试**
+路由策略链按 `gateway.yaml` 中 `routing.strategies` 配置的顺序依次执行：
 
-文件： `internal/decision/router_test.go`
+```
+Route(req)
+  │
+  ├─ req.Model 含 "/" → 显式路由，直接返回（不走策略链）
+  │
+  ├─ 按 config.routing.strategies 顺序遍历:
+  │   ├─ "semantic":     SemanticRouter.Route(req) → 匹配 → resolveModelList(targetModels)
+  │   ├─ "capability":   CapabilityRouter.Route(req, tokenEstimate) → 匹配 → resolveModelList(targetModels)
+  │   └─ "cost_cascade": CostRouter.CascadeFor(req.Model) → resolveModelList(chain)
+  │
+  ├─ 全部未命中 → resolveModelList(routing.cascade.default) 兜底
+  │
+  └─ 仍失败 → model_not_found error
+```
+
+每个策略输出"候选模型列表"。`resolveModelList` 遍历列表，对每个模型查询 Provider 注册表（`Registry.ProvidersForModel`），跳过熔断状态为 Open 的 Provider，找到可用 Provider 后通过 `Balancer.Select` 选出最终节点。
+
+`RouteDecision` 增加 `Strategy` 字段记录匹配的策略名，便于日志和指标打标。
+
+语义路由依赖 `internal/embedding` 的 `EmbeddingEngine`。为支持测试 mock，在 decision 包中定义 `Embedder` 接口：
+
+```go
+type Embedder interface {
+    Embed(texts []string) ([][]float64, error)
+}
+```
+
+`EmbeddingEngine` 隐式实现此接口，无需改动。
+
+### 初始化顺序（main.go 必读）
+
+```
+load config → init embedding engine → init registry → init balancer
+  → init circuit breakers                                   ← 任务 10（已有）
+  → NewSemanticRouter(cfg.SemanticRouting, eng)              ← 本任务
+  → NewCapabilityRouter(cfg.Routing.Rules)                   ← 本任务
+  → NewCostRouter(cfg.Routing.Cascade)                       ← 本任务
+  → NewRouter(strategies, defaultCascade, balancer, ...)     ← 本任务
+  → 注入 handler
+```
+
+语义路由需要在 Router 之前初始化，因为 `NewSemanticRouter` 中会调用嵌入引擎批量预计算类别原型向量。
+
+---
+
+### 阶段 A：语义路由（strategy_semantic）
+
+- [ ] **步骤 A1：先写语义路由测试**
+
+文件： `internal/decision/strategy_semantic_test.go`
 
 ```go
 package decision
@@ -2448,52 +2501,810 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/config"
 	"github.com/viif/momu-llmgateway/internal/model"
 )
 
-func TestRouterExplicitProviderPrefix(t *testing.T) {
-	r := NewRouter([]string{"deepseek-chat"}, nil, nil)
-	decision, err := r.Route(&model.StandardRequest{Model: "openai/gpt-4o"})
-	require.NoError(t, err)
-	require.Equal(t, "openai", decision.ProviderName)
-	require.Equal(t, "gpt-4o", decision.Model)
+type fakeEmbedder struct {
+	vectors map[string][]float64
 }
 
-func TestRouterDefaultModel(t *testing.T) {
-	r := NewRouter([]string{"deepseek-chat"}, nil, nil)
-	decision, err := r.Route(&model.StandardRequest{Model: ""})
+func (f *fakeEmbedder) Embed(texts []string) ([][]float64, error) {
+	out := make([][]float64, len(texts))
+	for i, t := range texts {
+		if v, ok := f.vectors[t]; ok {
+			out[i] = v
+		} else {
+			out[i] = make([]float64, 2)
+		}
+	}
+	return out, nil
+}
+
+func TestSemanticRouterPrecomputesPrototypes(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1": {1.0, 0.0},
+			"code2": {0.9, 0.1},
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1", "code2"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
 	require.NoError(t, err)
-	require.Equal(t, "deepseek-chat", decision.Model)
+	require.Len(t, sr.categories, 1)
+	require.Equal(t, "code", sr.categories[0].Name)
+	require.Len(t, sr.categories[0].Vector, 2)
+}
+
+func TestSemanticRouteMatchAboveThreshold(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1":     {1.0, 0.0},
+			"code2":     {0.9, -0.1},
+			"user query": {0.8, 0.1},
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1", "code2"}},
+			{Name: "creative", TargetModels: []string{"claude-sonnet-4-20250514"}, Exemplars: []string{"write a poem"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
+	require.NoError(t, err)
+
+	models, category, score := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "user query"}},
+	})
+	require.NotNil(t, models)
+	require.Equal(t, "code", category)
+	require.GreaterOrEqual(t, score, 0.75)
+	require.Equal(t, []string{"deepseek-chat"}, models)
+}
+
+func TestSemanticRouteMissBelowThreshold(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1":     {1.0, 0.0},
+			"code2":     {0.9, 0.1},
+			"user query": {0.0, 1.0}, // orthogonal to code vectors
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1", "code2"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
+	require.NoError(t, err)
+
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "user query"}},
+	})
+	require.Nil(t, models)
+}
+
+func TestSemanticRouteEmptyMessages(t *testing.T) {
+	sr := &SemanticRouter{threshold: 0.75}
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{},
+	})
+	require.Nil(t, models)
+}
+
+func TestSemanticRouteNoEngine(t *testing.T) {
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, nil)
+	require.NoError(t, err)
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "query"}},
+	})
+	require.Nil(t, models)
+}
+```
+
+- [ ] **步骤 A2：运行测试确认失败**
+
+```bash
+go test ./internal/decision -run 'TestSemanticRouter' -v
+```
+
+预期：失败，提示 `NewSemanticRouter`、`SemanticRouter` 未定义。
+
+- [ ] **步骤 A3：实现语义路由**
+
+文件： `internal/decision/strategy_semantic.go`
+
+```go
+package decision
+
+import (
+	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/viif/momu-llmgateway/internal/embedding"
+	"github.com/viif/momu-llmgateway/internal/model"
+)
+
+type Embedder interface {
+	Embed(texts []string) ([][]float64, error)
+}
+
+type CategoryPrototype struct {
+	Name         string
+	TargetModels []string
+	Vector       []float64
+}
+
+type SemanticRouter struct {
+	categories []CategoryPrototype
+	threshold  float64
+	engine     Embedder
+}
+
+func NewSemanticRouter(cfg config.SemanticRoutingConfig, eng Embedder) (*SemanticRouter, error) {
+	sr := &SemanticRouter{threshold: cfg.SimilarityThreshold, engine: eng}
+	if eng == nil || len(cfg.Categories) == 0 {
+		return sr, nil
+	}
+
+	for _, cat := range cfg.Categories {
+		vecs, err := eng.Embed(cat.Exemplars)
+		if err != nil {
+			return nil, err
+		}
+		if len(vecs) == 0 {
+			continue
+		}
+
+		prototype := make([]float64, len(vecs[0]))
+		for _, v := range vecs {
+			for i := range v {
+				prototype[i] += v[i]
+			}
+		}
+		n := float64(len(vecs))
+		for i := range prototype {
+			prototype[i] /= n
+		}
+		prototype = embedding.NormalizeVector(prototype)
+
+		sr.categories = append(sr.categories, CategoryPrototype{
+			Name:         cat.Name,
+			TargetModels: append([]string(nil), cat.TargetModels...),
+			Vector:       prototype,
+		})
+	}
+	return sr, nil
+}
+
+func (sr *SemanticRouter) Route(req *model.StandardRequest) (models []string, category string, confidence float64) {
+	if sr.engine == nil || len(sr.categories) == 0 {
+		return nil, "", 0
+	}
+
+	text := concatenateUserMessages(req.Messages)
+	if text == "" {
+		return nil, "", 0
+	}
+
+	vecs, err := sr.engine.Embed([]string{text})
+	if err != nil || len(vecs) == 0 {
+		return nil, "", 0
+	}
+
+	for _, cat := range sr.categories {
+		score := embedding.CosineSimilarity(vecs[0], cat.Vector)
+		if score >= sr.threshold && score > confidence {
+			confidence = score
+			category = cat.Name
+			models = cat.TargetModels
+		}
+	}
+	return models, category, confidence
+}
+
+func concatenateUserMessages(messages []model.Message) string {
+	var parts []string
+	for _, m := range messages {
+		if m.Role == "user" && m.Content != "" {
+			parts = append(parts, m.Content)
+		}
+	}
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+```
+
+- [ ] **步骤 A4：验证测试通过**
+
+```bash
+go test ./internal/decision -run 'TestSemanticRouter' -v
+```
+
+预期：全部 PASS。
+
+- [ ] **步骤 A5：提交**
+
+```bash
+git add internal/decision/strategy_semantic.go internal/decision/strategy_semantic_test.go
+git commit -m "feat: 添加语义路由策略"
+```
+
+---
+
+### 阶段 B：能力路由（strategy_capability）
+
+- [ ] **步骤 B1：先写能力路由测试**
+
+文件： `internal/decision/strategy_capability_test.go`
+
+```go
+package decision
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/viif/momu-llmgateway/internal/model"
+)
+
+func TestCapabilityMatchByTaskType(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "long_context", TargetModels: []string{"claude-sonnet-4-20250514"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "long_context"}, 0)
+	require.Equal(t, []string{"claude-sonnet-4-20250514"}, models)
+}
+
+func TestCapabilityMismatchTaskType(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "long_context", TargetModels: []string{"claude-sonnet-4-20250514"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "code"}, 0)
+	require.Nil(t, models)
+}
+
+func TestCapabilityConditionGreaterThan(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "long_context", Condition: "input_tokens > 100000", TargetModels: []string{"claude-sonnet-4-20250514"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "long_context"}, 150000)
+	require.Equal(t, []string{"claude-sonnet-4-20250514"}, models)
+}
+
+func TestCapabilityConditionLessThan(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "long_context", Condition: "input_tokens > 100000", TargetModels: []string{"claude-sonnet-4-20250514"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "long_context"}, 50000)
+	require.Nil(t, models)
+}
+
+func TestCapabilityInvalidConditionIgnored(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "test", Condition: "unknown_field > 10", TargetModels: []string{"m"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "test"}, 0)
+	require.Nil(t, models)
+}
+
+func TestCapabilityMultipleRulesFirstWins(t *testing.T) {
+	cr := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "a", TargetModels: []string{"model-a"}},
+		{TaskType: "a", TargetModels: []string{"model-b"}},
+	})
+	models := cr.Route(&model.StandardRequest{TaskType: "a"}, 0)
+	require.Equal(t, []string{"model-a"}, models)
+}
+
+func TestCapabilityNoRules(t *testing.T) {
+	cr := NewCapabilityRouter(nil)
+	models := cr.Route(&model.StandardRequest{TaskType: "foo"}, 0)
+	require.Nil(t, models)
+}
+```
+
+- [ ] **步骤 B2：运行测试确认失败**
+
+```bash
+go test ./internal/decision -run 'TestCapability' -v
+```
+
+预期：失败，提示 `NewCapabilityRouter` 未定义。
+
+- [ ] **步骤 B3：实现能力路由**
+
+文件： `internal/decision/strategy_capability.go`
+
+```go
+package decision
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/viif/momu-llmgateway/internal/model"
+)
+
+type CapabilityRouter struct {
+	rules []config.RoutingRuleConfig
+}
+
+func NewCapabilityRouter(rules []config.RoutingRuleConfig) *CapabilityRouter {
+	return &CapabilityRouter{rules: rules}
+}
+
+func (cr *CapabilityRouter) Route(req *model.StandardRequest, estimatedTokens int) []string {
+	for _, rule := range cr.rules {
+		if matchesRule(rule, req, estimatedTokens) {
+			return rule.TargetModels
+		}
+	}
+	return nil
+}
+
+func matchesRule(rule config.RoutingRuleConfig, req *model.StandardRequest, estimatedTokens int) bool {
+	if rule.TaskType != "" && rule.TaskType != req.TaskType {
+		return false
+	}
+	if rule.Condition != "" && !evaluateCondition(rule.Condition, estimatedTokens) {
+		return false
+	}
+	return true
+}
+
+func evaluateCondition(condition string, inputTokens int) bool {
+	parts := strings.Fields(condition)
+	if len(parts) != 3 || parts[0] != "input_tokens" {
+		return false
+	}
+	threshold, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return false
+	}
+	switch parts[1] {
+	case ">":
+		return inputTokens > threshold
+	case "<":
+		return inputTokens < threshold
+	case ">=":
+		return inputTokens >= threshold
+	case "<=":
+		return inputTokens <= threshold
+	default:
+		return false
+	}
+}
+```
+
+- [ ] **步骤 B4：验证测试通过**
+
+```bash
+go test ./internal/decision -run 'TestCapability' -v
+```
+
+预期：全部 PASS。
+
+- [ ] **步骤 B5：提交**
+
+```bash
+git add internal/decision/strategy_capability.go internal/decision/strategy_capability_test.go
+git commit -m "feat: 添加能力路由策略"
+```
+
+---
+
+### 阶段 C：成本级联路由（strategy_cost）
+
+- [ ] **步骤 C1：先写成本路由测试**
+
+文件： `internal/decision/strategy_cost_test.go`
+
+```go
+package decision
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestCostCascadeForKnownModel(t *testing.T) {
+	cr := NewCostRouter(map[string][]string{
+		"gpt-4o":      {"gpt-4o-mini", "deepseek-chat"},
+		"default":     {"deepseek-chat", "gpt-4o-mini"},
+	})
+	chain := cr.CascadeFor("gpt-4o")
+	require.Equal(t, []string{"gpt-4o-mini", "deepseek-chat"}, chain)
+}
+
+func TestCostCascadeFallsBackToDefault(t *testing.T) {
+	cr := NewCostRouter(map[string][]string{
+		"default": {"deepseek-chat", "gpt-4o-mini"},
+	})
+	chain := cr.CascadeFor("unknown-model")
+	require.Equal(t, []string{"deepseek-chat", "gpt-4o-mini"}, chain)
+}
+
+func TestCostCascadeEmptyChains(t *testing.T) {
+	cr := NewCostRouter(map[string][]string{})
+	chain := cr.CascadeFor("any-model")
+	require.Nil(t, chain)
+}
+
+func TestCostCascadeNoDefaultChain(t *testing.T) {
+	cr := NewCostRouter(map[string][]string{
+		"gpt-4o": {"gpt-4o-mini"},
+	})
+	chain := cr.CascadeFor("unknown-model")
+	require.Nil(t, chain)
+}
+```
+
+- [ ] **步骤 C2：运行测试确认失败**
+
+```bash
+go test ./internal/decision -run 'TestCostCascade' -v
+```
+
+预期：失败，提示 `NewCostRouter` 未定义。
+
+- [ ] **步骤 C3：实现成本级联路由**
+
+文件： `internal/decision/strategy_cost.go`
+
+```go
+package decision
+
+type CostRouter struct {
+	chains map[string][]string
+}
+
+func NewCostRouter(chains map[string][]string) *CostRouter {
+	return &CostRouter{chains: chains}
+}
+
+func (cr *CostRouter) CascadeFor(model string) []string {
+	if chain, ok := cr.chains[model]; ok && len(chain) > 0 {
+		return chain
+	}
+	if chain, ok := cr.chains["default"]; ok && len(chain) > 0 {
+		return chain
+	}
+	return nil
+}
+```
+
+- [ ] **步骤 C4：验证测试通过**
+
+```bash
+go test ./internal/decision -run 'TestCostCascade' -v
+```
+
+预期：全部 PASS。
+
+- [ ] **步骤 C5：提交**
+
+```bash
+git add internal/decision/strategy_cost.go internal/decision/strategy_cost_test.go
+git commit -m "feat: 添加成本级联路由策略"
+```
+
+---
+
+### 阶段 D：整合 Router 策略链
+
+- [ ] **步骤 D1：先写 Router 集成测试**
+
+文件： `internal/decision/router_test.go`
+
+```go
+package decision
+
+import (
+	"context"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/viif/momu-llmgateway/internal/model"
+)
+
+// fakeProvider implements model.Provider for test
+type fakeRegProvider struct {
+	name   string
+	models []string
+}
+
+func (f fakeRegProvider) Name() string                                                  { return f.name }
+func (f fakeRegProvider) Models() []string                                               { return f.models }
+func (f fakeRegProvider) Send(context.Context, *model.StandardRequest) (*model.StandardResponse, error) { return nil, nil }
+func (f fakeRegProvider) SendStream(context.Context, *model.StandardRequest) (<-chan model.StreamChunk, error) { return nil, nil }
+
+func TestRouterExplicitRoute(t *testing.T) {
+	r := NewRouter(RouterConfig{Strategies: []string{"semantic"}}, nil, nil, nil, nil, nil, nil)
+	dec, err := r.Route(&model.StandardRequest{Model: "openai/gpt-4o"})
+	require.NoError(t, err)
+	require.Equal(t, "openai", dec.ProviderName)
+	require.Equal(t, "gpt-4o", dec.Model)
+	require.Equal(t, "explicit", dec.Strategy)
+}
+
+func TestRouterModelNotFound(t *testing.T) {
+	r := NewRouter(RouterConfig{Strategies: []string{}}, nil, nil, nil, nil, nil, nil)
+	_, err := r.Route(&model.StandardRequest{Model: ""})
+	require.Error(t, err)
 }
 
 func TestRouterWithBalancerSelectsProvider(t *testing.T) {
 	b := NewBalancer(BalancerConfig{})
-	candidatesFn := func(model string) []ProviderCandidate {
+	b.Register("openai")
+	b.Register("deepseek")
+
+	// modelProviders returns fake providers for a model name
+	modelProviders := func(model string) []model.Provider {
 		if model == "gpt-4o" {
-			return []ProviderCandidate{
-				{ProviderName: "openai", Model: "gpt-4o", BaseWeight: 1, HealthScore: 0, WarmupFactor: 1},
-				{ProviderName: "deepseek", Model: "gpt-4o", BaseWeight: 100, HealthScore: 1, WarmupFactor: 1},
+			return []model.Provider{
+				fakeRegProvider{name: "openai", models: []string{"gpt-4o"}},
+				fakeRegProvider{name: "deepseek", models: []string{"gpt-4o"}},
 			}
 		}
 		return nil
 	}
-	r := NewRouter(nil, b, candidatesFn)
-	decision, err := r.Route(&model.StandardRequest{Model: "gpt-4o"})
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			w := 100.0
+			if p.Name() == "openai" {
+				w = 1
+			}
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: w, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	r := NewRouter(
+		RouterConfig{Strategies: []string{"cost_cascade"}, DefaultCascade: []string{}},
+		b, nil, nil, nil, modelProviders, buildCandidates,
+	)
+	dec, err := r.Route(&model.StandardRequest{Model: "gpt-4o"})
 	require.NoError(t, err)
-	require.Equal(t, "deepseek", decision.ProviderName)
-	require.Equal(t, "gpt-4o", decision.Model)
+	require.Equal(t, "deepseek", dec.ProviderName)
+	require.Equal(t, "gpt-4o", dec.Model)
+}
+
+func TestRouterDefaultCascade(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	b.Register("deepseek")
+
+	modelProviders := func(model string) []model.Provider {
+		if model == "deepseek-chat" {
+			return []model.Provider{fakeRegProvider{name: "deepseek", models: []string{"deepseek-chat"}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: 100, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	r := NewRouter(
+		RouterConfig{Strategies: []string{}, DefaultCascade: []string{"deepseek-chat"}},
+		b, nil, nil, nil, modelProviders, buildCandidates,
+	)
+	dec, err := r.Route(&model.StandardRequest{Model: ""})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek-chat", dec.Model)
+	require.Equal(t, "deepseek", dec.ProviderName)
+	require.Equal(t, "default", dec.Strategy)
+}
+
+func TestRouterStrategyOrder(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	b.Register("deepseek")
+
+	modelProviders := func(model string) []model.Provider {
+		if model == "deepseek-chat" || model == "gpt-4o" {
+			return []model.Provider{fakeRegProvider{name: "deepseek", models: []string{model}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: 100, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	// Capability router matches "long_context" task type → gpt-4o
+	capRouter := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "long_context", TargetModels: []string{"gpt-4o"}},
+	})
+
+	// Strategies: semantic first (won't match), capability second (will match)
+	r := NewRouter(
+		RouterConfig{Strategies: []string{"capability"}, DefaultCascade: []string{"deepseek-chat"}},
+		b, nil, capRouter, nil, modelProviders, buildCandidates,
+	)
+	dec, err := r.Route(&model.StandardRequest{Model: "claude-sonnet-4-20250514", TaskType: "long_context"})
+	require.NoError(t, err)
+	require.Equal(t, "gpt-4o", dec.Model)
+	require.Equal(t, "capability", dec.Strategy)
+}
+
+func TestRouterCostCascadeFallsBackToDefault(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	b.Register("deepseek")
+
+	modelProviders := func(model string) []model.Provider {
+		if model == "deepseek-chat" {
+			return []model.Provider{fakeRegProvider{name: "deepseek", models: []string{"deepseek-chat"}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: 100, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	costRouter := NewCostRouter(map[string][]string{
+		"gpt-4o":  {"gpt-4o-mini"},
+		"default": {"deepseek-chat"},
+	})
+
+	r := NewRouter(
+		RouterConfig{Strategies: []string{"cost_cascade"}, DefaultCascade: []string{"deepseek-chat"}},
+		b, nil, nil, costRouter, modelProviders, buildCandidates,
+	)
+
+	// "unknown" has no cascade chain, falls back to "default" → deepseek-chat
+	dec, err := r.Route(&model.StandardRequest{Model: "unknown"})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek-chat", dec.Model)
+}
+
+func TestRouterModelListSkipsUnavailableProviders(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	b.Register("deepseek")
+
+	// Only deepseek-chat has a provider; gpt-4o-mini does not
+	modelProviders := func(model string) []model.Provider {
+		if model == "deepseek-chat" {
+			return []model.Provider{fakeRegProvider{name: "deepseek", models: []string{"deepseek-chat"}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: 100, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	// Default cascade: gpt-4o-mini (no providers) → deepseek-chat (has providers)
+	r := NewRouter(
+		RouterConfig{Strategies: []string{}, DefaultCascade: []string{"gpt-4o-mini", "deepseek-chat"}},
+		b, nil, nil, nil, modelProviders, buildCandidates,
+	)
+	dec, err := r.Route(&model.StandardRequest{Model: ""})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek-chat", dec.Model)
+}
+
+func TestRouterSemanticViaIntegration(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+	b.Register("deepseek")
+
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1":        {1.0, 0.0},
+			"user is query": {0.9, 0.05},
+		},
+	}
+
+	semanticRouter, err := NewSemanticRouter(
+		config.SemanticRoutingConfig{
+			SimilarityThreshold: 0.75,
+			Categories: []config.SemanticCategoryConfig{
+				{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1"}},
+			},
+		},
+		fake,
+	)
+	require.NoError(t, err)
+
+	modelProviders := func(model string) []model.Provider {
+		if model == "deepseek-chat" {
+			return []model.Provider{fakeRegProvider{name: "deepseek", models: []string{"deepseek-chat"}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		cands := make([]ProviderCandidate, len(providers))
+		for i, p := range providers {
+			cands[i] = ProviderCandidate{ProviderName: p.Name(), Model: model, BaseWeight: 100, HealthScore: 1, WarmupFactor: 1}
+		}
+		return cands
+	}
+
+	r := NewRouter(
+		RouterConfig{Strategies: []string{"semantic"}, DefaultCascade: []string{"gpt-4o-mini"}},
+		b, semanticRouter, nil, nil, modelProviders, buildCandidates,
+	)
+
+	dec, err := r.Route(&model.StandardRequest{
+		Model:    "gpt-4o",
+		Messages: []model.Message{{Role: "user", Content: "user is query"}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek-chat", dec.Model)
+	require.Equal(t, "semantic", dec.Strategy)
+}
+
+func TestRouterExplicitBypassesStrategyChain(t *testing.T) {
+	b := NewBalancer(BalancerConfig{})
+
+	// Capability router would match this task type
+	capRouter := NewCapabilityRouter([]config.RoutingRuleConfig{
+		{TaskType: "code", TargetModels: []string{"gpt-4o"}},
+	})
+
+	modelProviders := func(model string) []model.Provider {
+		if model == "gpt-4o" {
+			return []model.Provider{fakeRegProvider{name: "openai", models: []string{"gpt-4o"}}}
+		}
+		return nil
+	}
+	buildCandidates := func(providers []model.Provider, model string) []ProviderCandidate {
+		return []ProviderCandidate{{ProviderName: "openai", Model: model, BaseWeight: 1, HealthScore: 1, WarmupFactor: 1}}
+	}
+
+	r := NewRouter(
+		RouterConfig{Strategies: []string{"capability"}, DefaultCascade: []string{}},
+		b, nil, capRouter, nil, modelProviders, buildCandidates,
+	)
+
+	// Explicit prefix should bypass capability routing
+	dec, err := r.Route(&model.StandardRequest{Model: "deepseek/gpt-4o", TaskType: "code"})
+	require.NoError(t, err)
+	require.Equal(t, "deepseek", dec.ProviderName)
+	require.Equal(t, "gpt-4o", dec.Model)
+	require.Equal(t, "explicit", dec.Strategy)
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [ ] **步骤 D2：运行测试确认失败**
 
 ```bash
-go test ./internal/decision -run 'TestRouterExplicitProviderPrefix|TestRouterDefaultModel|TestRouterWithBalancerSelectsProvider' -v
+go test ./internal/decision -run 'TestRouter' -v
 ```
 
-预期：失败，提示 `NewRouter` 未定义。
+预期：失败，提示 `NewRouter` 签名不匹配（构造函数签名已变更）。
 
-- [ ] **步骤 3：实现路由核心**
+- [ ] **步骤 D3：实现 Router 策略链编排**
 
 文件： `internal/decision/router.go`
 
@@ -2506,90 +3317,167 @@ import (
 	"github.com/viif/momu-llmgateway/internal/model"
 )
 
-type RouteDecision struct { ProviderName string; Model string }
-
-type ModelCandidatesFunc func(model string) []ProviderCandidate
-
-type Router struct {
-	defaultCascade  []string
-	balancer        *Balancer
-	modelCandidates ModelCandidatesFunc
+type RouteDecision struct {
+	ProviderName string
+	Model        string
+	Strategy     string
 }
 
-func NewRouter(defaultCascade []string, balancer *Balancer, candidatesFn ModelCandidatesFunc) *Router {
-	return &Router{defaultCascade: defaultCascade, balancer: balancer, modelCandidates: candidatesFn}
+type RouterConfig struct {
+	Strategies     []string
+	DefaultCascade []string
+}
+
+type ModelProvidersFunc func(model string) []model.Provider
+type BuildCandidatesFunc func(providers []model.Provider, model string) []ProviderCandidate
+
+type Router struct {
+	strategies      []string
+	defaultCascade  []string
+	balancer        *Balancer
+	semanticRouter  *SemanticRouter
+	capabilityRouter *CapabilityRouter
+	costRouter      *CostRouter
+	modelProviders  ModelProvidersFunc
+	buildCandidates BuildCandidatesFunc
+}
+
+func NewRouter(
+	cfg RouterConfig,
+	balancer *Balancer,
+	semantic *SemanticRouter,
+	capability *CapabilityRouter,
+	cost *CostRouter,
+	modelProviders ModelProvidersFunc,
+	buildCandidates BuildCandidatesFunc,
+) *Router {
+	return &Router{
+		strategies:       cfg.Strategies,
+		defaultCascade:   cfg.DefaultCascade,
+		balancer:         balancer,
+		semanticRouter:   semantic,
+		capabilityRouter: capability,
+		costRouter:       cost,
+		modelProviders:   modelProviders,
+		buildCandidates:  buildCandidates,
+	}
 }
 
 func (r *Router) Route(req *model.StandardRequest) (RouteDecision, error) {
-	var providerName, modelName string
-
+	// 1. Explicit routing bypasses all strategies
 	if strings.Contains(req.Model, "/") {
 		parts := strings.SplitN(req.Model, "/", 2)
-		providerName = parts[0]
-		modelName = parts[1]
-	} else if req.Model != "" {
-		modelName = req.Model
-	} else if len(r.defaultCascade) > 0 {
-		modelName = r.defaultCascade[0]
+		return RouteDecision{ProviderName: parts[0], Model: parts[1], Strategy: "explicit"}, nil
 	}
 
-	if modelName == "" && providerName == "" {
-		return RouteDecision{}, model.NewError(model.ErrCodeModelNotFound, "no route matched")
-	}
+	// 2. Execute strategy chain in configured order
+	for _, strategy := range r.strategies {
+		switch strategy {
+		case "explicit":
+			continue // handled above
 
-	if providerName == "" && r.balancer != nil && r.modelCandidates != nil {
-		candidates := r.modelCandidates(modelName)
-		if len(candidates) > 0 {
-			selected := r.balancer.Select(candidates)
-			if selected.ProviderName != "" {
-				return RouteDecision{ProviderName: selected.ProviderName, Model: selected.Model}, nil
+		case "semantic":
+			if r.semanticRouter != nil {
+				models, _, _ := r.semanticRouter.Route(req)
+				if dec, ok := r.resolveModelList(models, "semantic"); ok {
+					return dec, nil
+				}
+			}
+
+		case "capability":
+			if r.capabilityRouter != nil {
+				tokenEstimate := estimateInputTokens(req.Messages)
+				models := r.capabilityRouter.Route(req, tokenEstimate)
+				if dec, ok := r.resolveModelList(models, "capability"); ok {
+					return dec, nil
+				}
+			}
+
+		case "cost_cascade":
+			if r.costRouter != nil {
+				chain := r.costRouter.CascadeFor(req.Model)
+				if len(chain) == 0 {
+					chain = r.defaultCascade
+				}
+				if dec, ok := r.resolveModelList(chain, "cost_cascade"); ok {
+					return dec, nil
+				}
 			}
 		}
 	}
 
-	return RouteDecision{ProviderName: providerName, Model: modelName}, nil
+	// 3. Default fallback
+	if len(r.defaultCascade) > 0 {
+		if dec, ok := r.resolveModelList(r.defaultCascade, "default"); ok {
+			return dec, nil
+		}
+	}
+
+	// 4. Last resort: if request has a model, try to use it directly
+	if req.Model != "" {
+		providers := r.modelProviders(req.Model)
+		if dec, ok := r.resolveWithBalancer(providers, req.Model, "default"); ok {
+			return dec, nil
+		}
+	}
+
+	return RouteDecision{}, model.NewError(model.ErrCodeModelNotFound, "no route matched")
+}
+
+func (r *Router) resolveModelList(models []string, strategy string) (RouteDecision, bool) {
+	for _, m := range models {
+		providers := r.modelProviders(m)
+		if len(providers) == 0 {
+			continue
+		}
+		if dec, ok := r.resolveWithBalancer(providers, m, strategy); ok {
+			return dec, true
+		}
+	}
+	return RouteDecision{}, false
+}
+
+func (r *Router) resolveWithBalancer(providers []model.Provider, model, strategy string) (RouteDecision, bool) {
+	if r.balancer != nil && r.buildCandidates != nil {
+		candidates := r.buildCandidates(providers, model)
+		if len(candidates) > 0 {
+			selected := r.balancer.Select(candidates)
+			if selected.ProviderName != "" {
+				return RouteDecision{ProviderName: selected.ProviderName, Model: model, Strategy: strategy}, true
+			}
+		}
+	}
+	if len(providers) > 0 {
+		return RouteDecision{ProviderName: providers[0].Name(), Model: model, Strategy: strategy}, true
+	}
+	return RouteDecision{}, false
+}
+
+func estimateInputTokens(messages []model.Message) int {
+	totalChars := 0
+	for _, m := range messages {
+		totalChars += len(m.Content)
+	}
+	if totalChars > 0 {
+		return totalChars / 4
+	}
+	return 0
 }
 ```
 
-文件： `internal/decision/strategy_capability.go`
-
-```go
-package decision
-
-func MatchCapability(taskType string, rules map[string][]string) []string { return rules[taskType] }
-```
-
-文件： `internal/decision/strategy_cost.go`
-
-```go
-package decision
-
-func FirstCostCascade(cascade []string) string { if len(cascade) == 0 { return "" }; return cascade[0] }
-```
-
-文件： `internal/decision/strategy_semantic.go`
-
-```go
-package decision
-
-type SemanticMatch struct { Category string; Confidence float64; TargetModels []string }
-
-func AcceptSemanticMatch(match SemanticMatch, threshold float64) bool { return match.Confidence >= threshold && len(match.TargetModels) > 0 }
-```
-
-- [ ] **步骤 4：验证测试通过**
+- [ ] **步骤 D4：验证全量测试通过**
 
 ```bash
-go test ./internal/decision -run 'TestRouterExplicitProviderPrefix|TestRouterDefaultModel' -v
+go test ./internal/decision -v
 ```
 
-预期：PASS。
+预期：全部 PASS（含已有 `TestCircuitBreaker*`、`Test*Weight*`、`TestSWRR*`、`TestSelect*`、`TestRegister*` 以及新增的全部路由测试）。
 
-- [ ] **步骤 5：提交**
+- [ ] **步骤 D5：提交**
 
 ```bash
-git add internal/decision/strategy_*.go internal/decision/router.go internal/decision/router_test.go
-git commit -m "feat: 添加路由策略链"
+git add internal/decision/router.go internal/decision/router_test.go
+git commit -m "feat: 实现路由策略链编排"
 ```
 
 ---
