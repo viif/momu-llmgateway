@@ -33,3 +33,6 @@ go.work.sum
 
 # claude code
 .claude/settings.local.json
+
+# embedding model files
+.models/

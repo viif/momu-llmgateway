@@ -7,14 +7,57 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install ONNX Runtime
+        run: |
+          ONNX_VERSION="1.25.0"
+          ONNX_URL="https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz"
+          curl -sL "$ONNX_URL" -o onnxruntime.tgz
+          tar xzf onnxruntime.tgz
+          sudo cp onnxruntime-linux-x64-*/lib/libonnxruntime.so* /usr/local/lib/
+          sudo ldconfig
+          echo "ONNXRUNTIME_LIB_PATH=/usr/local/lib/libonnxruntime.so.${ONNX_VERSION}" >> $GITHUB_ENV
+
+      - name: Download BGE Model
+        run: |
+          MODEL_DIR="./.models/bge-small-zh-v1.5"
+          ONNX_DIR="$MODEL_DIR"
+          HF_BASE="https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/resolve/main"
+          mkdir -p "$ONNX_DIR"
+          curl -sL "$HF_BASE/onnx/model.onnx" -o "$ONNX_DIR/model.onnx"
+          curl -sL "$HF_BASE/onnx/model.onnx_data" -o "$ONNX_DIR/model.onnx_data"
+          curl -sL "$HF_BASE/tokenizer.json" -o "$ONNX_DIR/tokenizer.json"
+          curl -sL "$HF_BASE/tokenizer_config.json" -o "$ONNX_DIR/tokenizer_config.json"
+          echo "EMBEDDING_MODEL_PATH=$MODEL_DIR" >> $GITHUB_ENV
+
       - name: Build
         run: go build ./...
+
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
