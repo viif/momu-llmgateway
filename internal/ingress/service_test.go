@@ -18,8 +18,8 @@ type mockProvider struct {
 	err    error
 }
 
-func (m *mockProvider) Name() string                   { return m.name }
-func (m *mockProvider) Models() []string               { return m.models }
+func (m *mockProvider) Name() string     { return m.name }
+func (m *mockProvider) Models() []string { return m.models }
 func (m *mockProvider) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
 	return m.resp, m.err
 }
@@ -31,7 +31,7 @@ func (m *mockProvider) SendStream(ctx context.Context, req *model.StandardReques
 
 type mockRouter struct {
 	decision decision.RouteDecision
-	err       error
+	err      error
 }
 
 func (m *mockRouter) Route(req *model.StandardRequest) (decision.RouteDecision, error) {
