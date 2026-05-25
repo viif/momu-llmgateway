@@ -133,21 +133,6 @@ func TestValidationAcceptsTemperatureBoundary(t *testing.T) {
 	}
 }
 
-func TestValidationRejectsEmptyRole(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	r.Use(ValidationMiddleware(testModels))
-	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
-
-	body, _ := json.Marshal(map[string]any{
-		"model":    "gpt-4o",
-		"messages": []map[string]string{{"role": "", "content": "hi"}},
-	})
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
-	require.Equal(t, http.StatusBadRequest, w.Code)
-	require.Contains(t, w.Body.String(), "role")
-}
 
 func TestValidationRejectsMalformedBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)

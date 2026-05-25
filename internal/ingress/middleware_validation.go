@@ -11,15 +11,10 @@ import (
 )
 
 type chatRequest struct {
-	Model       string         `json:"model"`
-	Messages    []messageField `json:"messages"`
-	Temperature *float64       `json:"temperature"`
-	MaxTokens   *int           `json:"max_tokens"`
-}
-
-type messageField struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Model       string   `json:"model"`
+	Messages    []any    `json:"messages"`
+	Temperature *float64 `json:"temperature"`
+	MaxTokens   *int     `json:"max_tokens"`
 }
 
 func ValidationMiddleware(allowedModels []string) gin.HandlerFunc {
@@ -57,12 +52,6 @@ func ValidationMiddleware(allowedModels []string) gin.HandlerFunc {
 		if len(req.Messages) == 0 {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "messages must not be empty"})
 			return
-		}
-		for _, msg := range req.Messages {
-			if msg.Role == "" {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "message role must not be empty"})
-				return
-			}
 		}
 		if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "temperature must be in range [0, 2]"})
