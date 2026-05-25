@@ -86,6 +86,7 @@ type SemanticCacheConfig struct {
 	SimilarityThreshold float64       `mapstructure:"similarity_threshold"`
 	TTL                 time.Duration `mapstructure:"ttl"`
 	MaxEntries          int           `mapstructure:"max_entries"`
+	MaxPromptLength     int           `mapstructure:"max_prompt_length"`
 }
 
 type FallbackConfig struct {

@@ -40,6 +40,7 @@ type SemanticCache struct {
 	maxEntries        int
 	threshold         float64
 	ttl               time.Duration
+	maxPromptLength   int
 	enabled           bool
 	embedder          Embedder
 	store             CacheStore
@@ -51,6 +52,7 @@ type SemanticCacheConfig struct {
 	SimilarityThreshold float64
 	MaxEntries          int
 	TTL                 time.Duration
+	MaxPromptLength     int
 }
 
 func New(cfg SemanticCacheConfig, embedder Embedder, store CacheStore) *SemanticCache {
@@ -58,13 +60,14 @@ func New(cfg SemanticCacheConfig, embedder Embedder, store CacheStore) *Semantic
 		cfg.MaxEntries = 10000
 	}
 	return &SemanticCache{
-		entries:    make(map[string][]CacheEntry),
-		maxEntries: cfg.MaxEntries,
-		threshold:  cfg.SimilarityThreshold,
-		ttl:        cfg.TTL,
-		enabled:    cfg.Enabled,
-		embedder:   embedder,
-		store:      store,
+		entries:         make(map[string][]CacheEntry),
+		maxEntries:      cfg.MaxEntries,
+		threshold:       cfg.SimilarityThreshold,
+		ttl:             cfg.TTL,
+		maxPromptLength: cfg.MaxPromptLength,
+		enabled:         cfg.Enabled,
+		embedder:        embedder,
+		store:           store,
 	}
 }
 
@@ -80,6 +83,10 @@ func (c *SemanticCache) Lookup(ctx context.Context, req *model.StandardRequest) 
 	}
 	text := concatenateUserMessages(req.Messages)
 	if text == "" {
+		return nil, false
+	}
+	numRunes := len([]rune(text))
+	if c.maxPromptLength > 0 && numRunes > c.maxPromptLength {
 		return nil, false
 	}
 	vecs, err := c.embedder.Embed([]string{text})
@@ -135,6 +142,10 @@ func (c *SemanticCache) Store(ctx context.Context, req *model.StandardRequest, r
 	}
 	text := concatenateUserMessages(req.Messages)
 	if text == "" {
+		return nil
+	}
+	numRunes := len([]rune(text))
+	if c.maxPromptLength > 0 && numRunes > c.maxPromptLength {
 		return nil
 	}
 	vecs, err := c.embedder.Embed([]string{text})

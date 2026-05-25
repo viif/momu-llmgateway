@@ -268,6 +268,72 @@ func TestEncodeDecodeVector(t *testing.T) {
 	}
 }
 
+func TestLookupSkipWhenPromptExceedsMaxLength(t *testing.T) {
+	embedder := &fakeEmbedder{vectors: map[string][]float64{"hello": {1.0, 0.0}}}
+	cachedResp, _ := json.Marshal(&model.StandardResponse{ID: "cached", Model: "gpt-4o"})
+	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour, MaxPromptLength: 3}, embedder, nil)
+
+	c.mu.Lock()
+	c.entries["gpt-4o"] = []CacheEntry{
+		{Model: "gpt-4o", Key: "h1", Vector: []float64{1.0, 0.0}, ResponseJSON: cachedResp, StoredAt: time.Now(), LastAccess: time.Now()},
+	}
+	c.mu.Unlock()
+
+	_, ok := c.Lookup(context.Background(), &model.StandardRequest{
+		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hello world"}},
+	})
+	require.False(t, ok, "超长prompt应跳过缓存查询")
+}
+
+func TestLookupPromptWithinMaxLength(t *testing.T) {
+	embedder := &fakeEmbedder{vectors: map[string][]float64{"hi": {1.0, 0.0}}}
+	cachedResp, _ := json.Marshal(&model.StandardResponse{ID: "cached", Model: "gpt-4o"})
+	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour, MaxPromptLength: 5}, embedder, nil)
+
+	c.mu.Lock()
+	c.entries["gpt-4o"] = []CacheEntry{
+		{Model: "gpt-4o", Key: "h1", Vector: []float64{1.0, 0.0}, ResponseJSON: cachedResp, StoredAt: time.Now(), LastAccess: time.Now()},
+	}
+	c.mu.Unlock()
+
+	resp, ok := c.Lookup(context.Background(), &model.StandardRequest{
+		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}},
+	})
+	require.True(t, ok, "未超长的prompt应命中缓存")
+	require.True(t, resp.CacheHit)
+}
+
+func TestLookupMaxPromptLengthZeroUnlimited(t *testing.T) {
+	embedder := &fakeEmbedder{vectors: map[string][]float64{"hello": {1.0, 0.0}}}
+	cachedResp, _ := json.Marshal(&model.StandardResponse{ID: "cached", Model: "gpt-4o"})
+	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour, MaxPromptLength: 0}, embedder, nil)
+
+	c.mu.Lock()
+	c.entries["gpt-4o"] = []CacheEntry{
+		{Model: "gpt-4o", Key: "h1", Vector: []float64{1.0, 0.0}, ResponseJSON: cachedResp, StoredAt: time.Now(), LastAccess: time.Now()},
+	}
+	c.mu.Unlock()
+
+	_, ok := c.Lookup(context.Background(), &model.StandardRequest{
+		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hello"}},
+	})
+	require.True(t, ok, "MaxPromptLength=0时应不做限制")
+}
+
+func TestStoreSkipWhenPromptExceedsMaxLength(t *testing.T) {
+	embedder := &fakeEmbedder{vectors: map[string][]float64{"hello world": {1.0, 0.0}}}
+	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour, MaxPromptLength: 5}, embedder, nil)
+
+	err := c.Store(context.Background(), &model.StandardRequest{
+		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hello world"}},
+	}, &model.StandardResponse{ID: "resp-1", Model: "gpt-4o"})
+	require.NoError(t, err)
+
+	c.mu.RLock()
+	require.Len(t, c.entries["gpt-4o"], 0, "超长prompt不应写入缓存")
+	c.mu.RUnlock()
+}
+
 func TestCacheConcurrentAccess(t *testing.T) {
 	embedder := &fakeEmbedder{vectors: map[string][]float64{"hi": {1.0, 0.0}}}
 	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour}, embedder, nil)

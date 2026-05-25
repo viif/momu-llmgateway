@@ -99,6 +99,7 @@ semantic_cache:
   similarity_threshold: 0.95
   ttl: 1h
   max_entries: 10000
+  max_prompt_length: 1024
 fallback:
   retry_max: 2
   retry_backoff: "1s"
