@@ -336,9 +336,7 @@ circuit_breaker:
 
 平滑动态加权负载均衡（SWRR），有效权重公式：
 
-```
-W_eff = (W_base × F_warmup) × [1 / (1 + w1 × R_active + w2 × L_p99)] × S_health
-```
+$$W_{\text{eff}} = W_{\text{base}} \cdot F_{\text{warmup}} \cdot \frac{1}{1 + w_1 \!\cdot\! R_{\text{active}} + w_2 \!\cdot\! L_{p99}} \cdot S_{\text{health}}$$
 
 ```yaml
 balancer:
@@ -373,6 +371,31 @@ embedding:
 | `model_path` | BGE-small-zh-v1.5 模型目录，包含 `model.onnx`、`tokenizer.json`、`tokenizer_config.json` |
 
 嵌入引擎初始化失败时语义路由和语义缓存自动降级，不影响核心聊天补全功能。
+
+## Prometheus 指标
+
+所有指标通过 `GET /metrics` 端点暴露，格式为 Prometheus text 格式。
+
+### LLM 请求指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `llm_request_duration_seconds` | Histogram | `provider`, `model` | LLM 请求耗时分布 |
+| `llm_request_total` | Counter | `provider`, `model`, `status` | LLM 请求计数，`status` 取值为 `success` / `error` |
+| `llm_tokens_total` | Counter | `provider`, `model`, `direction` | Token 消耗统计，`direction` 取值为 `input` / `output` |
+
+### 韧性指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `llm_fallback_total` | Counter | `level`, `from_model`, `to_model` | 降级触发计数，`level` 为 `L1`~`L4` |
+| `llm_circuit_breaker_state` | Gauge | `provider`, `model` | 熔断器状态：0=Closed，1=Open，2=Half-Open |
+
+### 缓存指标
+
+| 指标名 | 类型 | 标签 | 说明 |
+|--------|------|------|------|
+| `llm_cache_hit_total` | Counter | `model`, `cache_type` | 语义缓存命中计数，`cache_type` 为 `memory` / `redis` |
 
 ## 开发
 
