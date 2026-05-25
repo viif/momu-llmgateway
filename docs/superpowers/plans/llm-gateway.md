@@ -25,7 +25,7 @@
 - `internal/egress/adapter.go`：Provider 注册表（切片 + 双 map + RWMutex，O(1) 查找）。
 - `internal/decision/circuitbreaker.go`：Provider+Model 维度的 Closed/Open/Half-Open 熔断器。
 - `internal/decision/balancer.go`：同模型多 Provider 的加权负载均衡。
-- `internal/decision/strategy_capability.go`：按 task_type 和 token 长度的能力路由。
+- `internal/decision/strategy_capability.go`：基于 task_type 标签和 condition 条件的能力路由。
 - `internal/decision/strategy_cost.go`：低成本优先的级联路由。
 - `internal/decision/strategy_semantic.go`：基于 Embedding 相似度的语义路由。
 - `internal/decision/router.go`：策略链编排、显式路由和默认路由。
@@ -661,7 +661,7 @@ providers:
     weight: 75
     timeout: 60s
 routing:
-  strategies: ["explicit", "semantic", "capability", "cost_cascade"]
+  strategies: ["explicit", "capability", "semantic", "cost_cascade"]
   rules:
     - task_type: "long_context"
       condition: "input_tokens > 100000"
@@ -2449,8 +2449,8 @@ Route(req)
   ├─ req.Model 含 "/" → 显式路由，直接返回（不走策略链）
   │
   ├─ 按 config.routing.strategies 顺序遍历:
-  │   ├─ "semantic":     SemanticRouter.Route(req) → 匹配 → resolveModelList(targetModels)
   │   ├─ "capability":   CapabilityRouter.Route(req, tokenEstimate) → 匹配 → resolveModelList(targetModels)
+  │   ├─ "semantic":     SemanticRouter.Route(req) → 匹配 → resolveModelList(targetModels)
   │   └─ "cost_cascade": CostRouter.CascadeFor(req.Model) → resolveModelList(chain)
   │
   ├─ 全部未命中 → resolveModelList(routing.cascade.default) 兜底
@@ -3140,7 +3140,7 @@ func TestRouterStrategyOrder(t *testing.T) {
 		{TaskType: "long_context", TargetModels: []string{"gpt-4o"}},
 	})
 
-	// Strategies: semantic first (won't match), capability second (will match)
+	// Capability strategy matches "long_context" task type
 	r := NewRouter(
 		RouterConfig{Strategies: []string{"capability"}, DefaultCascade: []string{"deepseek-chat"}},
 		b, nil, capRouter, nil, modelProviders, buildCandidates,

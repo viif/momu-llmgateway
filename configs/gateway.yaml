@@ -49,19 +49,51 @@ providers:
     weight: 75
     timeout: 60s
 routing:
-  strategies: ["explicit", "semantic", "capability", "cost_cascade"]
+  strategies: ["explicit", "capability", "semantic", "cost_cascade"]
   rules:
     - task_type: "long_context"
       condition: "input_tokens > 100000"
       target_models: ["claude-sonnet-4-20250514", "deepseek-chat"]
+    - task_type: "reasoning"
+      condition: "input_tokens > 4000"
+      target_models: ["deepseek-reasoner", "gpt-4o"]
+    - task_type: "fast_response"
+      condition: "input_tokens < 500"
+      target_models: ["gpt-4o-mini", "glm-4-flash"]
   cascade:
     default: ["deepseek-chat", "gpt-4o-mini", "gpt-4o"]
+    gpt-4o: ["gpt-4o-mini", "deepseek-chat"]
+    claude-sonnet-4-20250514: ["deepseek-chat", "gpt-4o"]
+    deepseek-reasoner: ["deepseek-chat", "gpt-4o-mini"]
 semantic_routing:
   similarity_threshold: 0.75
   categories:
     - name: "code_generation"
       target_models: ["deepseek-chat", "gpt-4o"]
-      exemplars: ["Write a Python function that...", "Generate code to...", "帮我写一个..."]
+      exemplars:
+        - "Write a Python function that..."
+        - "Generate code to implement..."
+        - "帮我写一个 REST API 接口"
+        - "用 Go 实现一个并发安全的缓存"
+        - "Refactor this function to improve performance"
+        - "写一个 SQL 查询来统计每日活跃用户"
+    - name: "creative_writing"
+      target_models: ["claude-sonnet-4-20250514", "gpt-4o"]
+      exemplars:
+        - "Write a story about a robot learning to paint"
+        - "Create a poem in the style of Li Bai"
+        - "写一篇关于春天的散文"
+        - "帮我润色这段文案，让它更有感染力"
+        - "Draft a warm and professional marketing email"
+        - "帮我写一段产品发布会的开场白"
+    - name: "data_analysis"
+      target_models: ["gpt-4o", "deepseek-chat"]
+      exemplars:
+        - "Analyze this dataset and find trends"
+        - "分析这些日志中的错误分布"
+        - "Summarize the key findings from this report"
+        - "帮我从这段 JSON 数据中提取统计信息"
+        - "Compare these two approaches and recommend one"
 semantic_cache:
   enabled: true
   similarity_threshold: 0.95
