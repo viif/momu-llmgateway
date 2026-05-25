@@ -61,7 +61,7 @@ type ProviderConfig struct {
 type RoutingConfig struct {
 	Strategies []string            `mapstructure:"strategies"`
 	Rules      []RoutingRuleConfig `mapstructure:"rules"`
-	Cascade    map[string][]string `mapstructure:"cascade"`
+	Cascade   map[string][]string `mapstructure:"-"`
 }
 
 type RoutingRuleConfig struct {
@@ -92,7 +92,7 @@ type SemanticCacheConfig struct {
 type FallbackConfig struct {
 	RetryMax     int                 `mapstructure:"retry_max"`
 	RetryBackoff time.Duration       `mapstructure:"retry_backoff"`
-	Chains       map[string][]string `mapstructure:"chains"`
+	Chains      map[string][]string `mapstructure:"-"`
 }
 
 type CircuitBreakerConfig struct {
@@ -133,6 +133,10 @@ func Load(path string) (*Config, error) {
 	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, err
 	}
+
+	cfg.Routing.Cascade = v.GetStringMapStringSlice("routing.cascade")
+	cfg.Fallback.Chains = v.GetStringMapStringSlice("fallback.chains")
+
 	currentConfig.Store(&cfg)
 	return &cfg, nil
 }

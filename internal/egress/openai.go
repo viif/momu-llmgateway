@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -29,14 +30,23 @@ func (p *OpenAICompatible) Name() string { return p.name }
 func (p *OpenAICompatible) Models() []string { return p.models }
 
 func (p *OpenAICompatible) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
-	return json.Marshal(map[string]any{"model": req.Model, "messages": req.Messages, "stream": req.Stream, "temperature": req.Temperature, "max_tokens": req.MaxTokens})
+	body := map[string]any{
+		"model":    req.Model,
+		"messages": req.Messages,
+		"stream":   req.Stream,
+	}
+	if req.Temperature != nil {
+		body["temperature"] = *req.Temperature
+	}
+	if req.MaxTokens != nil {
+		body["max_tokens"] = *req.MaxTokens
+	}
+	return json.Marshal(body)
 }
 
 func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
 	body, err := p.buildRequestBody(req)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -49,7 +59,10 @@ func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 400 {
-		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
+		var errBody bytes.Buffer
+		_, _ = errBody.ReadFrom(resp.Body)
+		return nil, model.NewError(model.ErrCodeProviderError,
+			fmt.Sprintf("%s: %s", resp.Status, errBody.String()))
 	}
 	var out model.StandardResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -107,8 +120,11 @@ func streamOpenAI(ctx context.Context, client *http.Client, url, apiKey string, 
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
+		var errBody bytes.Buffer
+		_, _ = errBody.ReadFrom(resp.Body)
 		_ = resp.Body.Close()
-		return nil, model.NewError(model.ErrCodeProviderError, resp.Status)
+		return nil, model.NewError(model.ErrCodeProviderError,
+			fmt.Sprintf("%s: %s", resp.Status, errBody.String()))
 	}
 	out := make(chan model.StreamChunk)
 	go func() {
