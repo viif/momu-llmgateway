@@ -56,6 +56,10 @@ func (r *StandardResponse) ToJSON() ([]byte, error) {
 	return json.Marshal(r)
 }
 
+func (s *StreamChunk) ToJSON() ([]byte, error) {
+	return json.Marshal(s)
+}
+
 func ParseStandardRequest(data []byte) (*StandardRequest, error) {
 	var req StandardRequest
 	if err := json.Unmarshal(data, &req); err != nil {

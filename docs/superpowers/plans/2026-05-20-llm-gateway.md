@@ -5903,13 +5903,605 @@ git commit -m "test: 添加中间件链集成测试"
 
 ---
 
-## 任务 17：实现 HTTP Handler
+## 任务 17：实现聊天补全 Handler 完整编排
+
+> **说明：** 本任务实现 `POST /v1/chat/completions` 的完整请求处理链路，串联路由决策、熔断检查、语义缓存、Fallback 降级、Provider 调用、SSE 流式转发和 Prometheus 指标记录。与旧版"路由注册骨架"不同，本版本涵盖从请求解析到响应输出的全流程编排逻辑。
 
 **文件：**
-- 新建： `internal/ingress/handler.go`
-- 新建： `internal/ingress/handler_test.go`
+- 新建： `internal/ingress/service.go`（`ChatService` 接口与 `chatServiceImpl` 编排实现）
+- 新建： `internal/ingress/service_test.go`（编排逻辑单元测试）
+- 新建： `internal/ingress/handler.go`（路由注册 + 非流式 / 流式 Handler）
+- 新建： `internal/ingress/handler_test.go`（HTTP 集成测试）
 
-- [ ] **步骤 1：先写健康检查测试**
+**架构总览：**
+
+```
+POST /v1/chat/completions
+    │
+    ▼
+handler.chatCompletion(c)
+    ├─ 1. 读取请求体，调用 model.ParseStandardRequest 解析
+    ├─ 2. 注入 request_id 到 req.RequestID
+    ├─ 3. 判断 req.Stream 分流
+    │
+    ├─ [非流式] handleNonStream(c, svc, req)
+    │   ├─ cache.Lookup(ctx, req) → 命中则直接返回（CacheHit=true）
+    │   ├─ router.Route(req) → RouteDecision{ProviderName, Model, Strategy}
+    │   ├─ cb.Allow(decision.ProviderName, decision.Model) → 未通过返回 503
+    │   ├─ fallback.Execute(ctx, providerName, model, sendFn)
+    │   │   └─ sendFn 内部调用 provider.Send(ctx, req)
+    │   ├─ cb.RecordSuccess / RecordFailure
+    │   ├─ cache.Store(ctx, req, resp) → 异步写入
+    │   ├─ 记录指标（RequestDuration / RequestTotal / TokensTotal / FallbackTotal）
+    │   └─ 返回 JSON 响应
+    │
+    └─ [流式] handleStream(c, svc, req)
+        ├─ 设置 SSE 响应头（Content-Type: text/event-stream, Cache-Control: no-cache）
+        ├─ router.Route(req) → RouteDecision
+        ├─ cb.Allow(...) → 未通过返回 SSE error 并关闭
+        ├─ provider.SendStream(ctx, req) → 消费 chunk channel
+        ├─ 逐 chunk 写入 c.Writer: data: {...}\n\n, 每次 Flush()
+        ├─ cb.RecordSuccess / RecordFailure
+        ├─ 记录指标
+        └─ 发送 data: [DONE]
+```
+
+### 关键设计决策
+
+| 决策点 | 方案 |
+|--------|------|
+| 熔断器管理 | 新增 `CircuitBreakerManager`，维护 `map[providerKey] *CircuitBreaker`，key 格式 `provider/model` |
+| 指标记录位置 | 在 handler 中显式记录，不在 fallback engine 内部（关注点分离） |
+| 缓存的流式语义 | `SemanticCache.Store()` 已内置跳过 `req.Stream == true` 的逻辑，handler 无需特殊处理 |
+| `sendFn` 闭包 | 在 handler 中构造，封装熔断检查 → Provider 调用 → 熔断记录 |
+| `Fallback.Execute` 的兜底 | 全部失败时 `Execute` 返回兜底消息（`error=nil`），handler 对其不同处理：非流式返回 200 + 兜底内容，流式发送 SSE chunk |
+| RequestID 穿透 | 从 Gin context 取 `request_id`，透传至 `StandardRequest.RequestID`，用于全链路追踪 |
+
+---
+
+### 阶段 A：ChatService 接口与服务实现骨架
+
+- [ ] **步骤 A1：先写非流式编排测试（含 mock）**
+
+文件： `internal/ingress/service_test.go`
+
+```go
+package ingress
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/decision"
+	"github.com/viif/momu-llmgateway/internal/model"
+)
+
+// --- Mock types ---
+
+type mockProvider struct {
+	name   string
+	models []string
+	resp   *model.StandardResponse
+	err    error
+}
+
+func (m *mockProvider) Name() string                 { return m.name }
+func (m *mockProvider) Models() []string             { return m.models }
+func (m *mockProvider) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
+	return m.resp, m.err
+}
+func (m *mockProvider) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	ch := make(chan model.StreamChunk)
+	close(ch)
+	return ch, nil
+}
+
+type mockRouter struct {
+	decision decision.RouteDecision
+	err       error
+}
+
+func (m *mockRouter) Route(req *model.StandardRequest) (decision.RouteDecision, error) {
+	return m.decision, m.err
+}
+
+type mockCircuitBreaker struct {
+	allow bool
+	calls int
+}
+
+type mockCBManager struct {
+	breakers map[string]*mockCircuitBreaker
+}
+
+func (m *mockCBManager) Allow(prov, model string) bool {
+	key := prov + "/" + model
+	if cb, ok := m.breakers[key]; ok {
+		cb.calls++
+		return cb.allow
+	}
+	return true
+}
+func (m *mockCBManager) RecordSuccess(prov, model string) {}
+func (m *mockCBManager) RecordFailure(prov, model string) {}
+
+type mockCache struct {
+	hit  bool
+	resp *model.StandardResponse
+}
+
+func (m *mockCache) Lookup(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, bool) {
+	return m.resp, m.hit
+}
+func (m *mockCache) Store(ctx context.Context, req *model.StandardRequest, resp *model.StandardResponse) error {
+	return nil
+}
+
+type mockFallback struct {
+	resp  *model.StandardResponse
+	level string
+	err   error
+}
+
+func (m *mockFallback) Execute(ctx context.Context, provider, model string, sendFn decision.SendFunc) (*model.StandardResponse, string, error) {
+	return m.resp, m.level, m.err
+}
+
+// --- Tests ---
+
+func TestChatServiceNonStreamingSuccess(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o", Strategy: "capability"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		&mockCache{hit: false},
+		&mockFallback{resp: &model.StandardResponse{ID: "resp-1", Model: "gpt-4o", Choices: []model.Choice{{Index: 0, Message: model.Message{Role: "assistant", Content: "hi"}, FinishReason: "stop"}}}, level: "primary"},
+		func(name string) model.Provider { return &mockProvider{name: name} },
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, "resp-1", resp.ID)
+}
+
+func TestChatServiceCacheHit(t *testing.T) {
+	cachedResp := &model.StandardResponse{ID: "cached-1", Model: "gpt-4o", CacheHit: true, Choices: []model.Choice{{Message: model.Message{Content: "cached"}}}}
+	svc := NewChatService(
+		&mockRouter{},
+		&mockCBManager{},
+		&mockCache{hit: true, resp: cachedResp},
+		nil,
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	require.NoError(t, err)
+	require.True(t, resp.CacheHit)
+	require.Equal(t, "cached-1", resp.ID)
+}
+
+func TestChatServiceCircuitBreakerOpen(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: false}}},
+		&mockCache{hit: false},
+		nil,
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	require.Error(t, err)
+	require.Nil(t, resp)
+	me, ok := err.(*model.Error)
+	require.True(t, ok)
+	require.Equal(t, model.ErrCodeCircuitOpen, me.Code)
+}
+
+func TestChatServiceRouteError(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{err: model.NewError(model.ErrCodeModelNotFound, "no route")},
+		&mockCBManager{},
+		&mockCache{hit: false},
+		nil,
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "unknown", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	require.Error(t, err)
+	require.Nil(t, resp)
+}
+
+func TestChatServiceFallbackExhausted(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		&mockCache{hit: false},
+		&mockFallback{resp: &model.StandardResponse{ID: "fallback", Choices: []model.Choice{{Message: model.Message{Content: "fallback msg"}, FinishReason: "stop"}}}, level: "fallback_exhausted", err: nil},
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	// fallback_exhausted returns resp (not nil) with error = nil from Engine
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, "fallback", resp.ID)
+}
+
+func TestChatServiceNonStreamingRecordsMetrics(t *testing.T) {
+	// 验证 RequestID 注入、RouteDecision.Strategy 透传
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o", Strategy: "cost_cascade"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		&mockCache{hit: false},
+		&mockFallback{resp: &model.StandardResponse{ID: "r", Model: "gpt-4o", Provider: "openai", Choices: []model.Choice{{Message: model.Message{Content: "ok"}, FinishReason: "stop"}}, Usage: model.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15}}, level: "primary"},
+		func(name string) model.Provider { return &mockProvider{name: name} },
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}, Stream: false, RequestID: "req-123"}
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, "r", resp.ID)
+	require.Equal(t, "openai", resp.Provider)
+	require.Equal(t, 10, resp.Usage.PromptTokens)
+	require.Equal(t, 5, resp.Usage.CompletionTokens)
+	require.Equal(t, 15, resp.Usage.TotalTokens)
+}
+```
+
+- [ ] **步骤 A2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestChatService' -v
+```
+
+预期：失败，提示 `NewChatService`、`HandleChatCompletion` 未定义。
+
+- [ ] **步骤 A3：实现 ChatService 接口与服务**
+
+文件： `internal/ingress/service.go`
+
+```go
+package ingress
+
+import (
+	"context"
+	"time"
+
+	"github.com/viif/momu-llmgateway/internal/decision"
+	"github.com/viif/momu-llmgateway/internal/model"
+	"github.com/viif/momu-llmgateway/internal/observability"
+)
+
+type Router interface {
+	Route(req *model.StandardRequest) (decision.RouteDecision, error)
+}
+
+type CircuitBreakerManager interface {
+	Allow(provider, model string) bool
+	RecordSuccess(provider, model string)
+	RecordFailure(provider, model string)
+}
+
+type SemanticCache interface {
+	Lookup(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, bool)
+	Store(ctx context.Context, req *model.StandardRequest, resp *model.StandardResponse) error
+}
+
+type FallbackEngine interface {
+	Execute(ctx context.Context, provider, model string, sendFn decision.SendFunc) (*model.StandardResponse, string, error)
+}
+
+type ProviderLookupFunc func(name string) model.Provider
+
+type ChatService interface {
+	HandleChatCompletion(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error)
+	HandleChatCompletionStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error)
+}
+
+type chatServiceImpl struct {
+	router        Router
+	cbManager     CircuitBreakerManager
+	cache         SemanticCache
+	fallback      FallbackEngine
+	providerLookup ProviderLookupFunc
+}
+
+func NewChatService(
+	router Router,
+	cbManager CircuitBreakerManager,
+	cache SemanticCache,
+	fallback FallbackEngine,
+	providerLookup ProviderLookupFunc,
+) ChatService {
+	return &chatServiceImpl{
+		router:        router,
+		cbManager:     cbManager,
+		cache:         cache,
+		fallback:      fallback,
+		providerLookup: providerLookup,
+	}
+}
+
+func (s *chatServiceImpl) HandleChatCompletion(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
+	start := time.Now()
+
+	if req.Stream {
+		return nil, model.NewError(model.ErrCodeInvalidRequest, "use HandleChatCompletionStream for streaming requests")
+	}
+
+	if s.cache != nil {
+		if cachedResp, hit := s.cache.Lookup(ctx, req); hit {
+			observability.CacheHitTotal.WithLabelValues(req.Model, "semantic").Inc()
+			return cachedResp, nil
+		}
+	}
+
+	decision, err := s.router.Route(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if !s.cbManager.Allow(decision.ProviderName, decision.Model) {
+		return nil, model.NewError(model.ErrCodeCircuitOpen,
+			"circuit breaker open for "+decision.ProviderName+"/"+decision.Model)
+	}
+
+	sendFn := s.buildSendFn()
+
+	resp, level, err := s.fallback.Execute(ctx, decision.ProviderName, decision.Model, sendFn)
+	if err != nil {
+		return nil, err
+	}
+
+	resp.Provider = decision.ProviderName
+
+	metricsLabels := prometheus.Labels{
+		"provider": decision.ProviderName,
+		"model":    decision.Model,
+	}
+	observability.RequestDuration.With(metricsLabels).Observe(time.Since(start).Seconds())
+
+	status := "success"
+	if level == "fallback_exhausted" {
+		status = "fallback_exhausted"
+	} else if level != "primary" {
+		observability.FallbackTotal.WithLabelValues(level, req.Model, decision.Model).Inc()
+	}
+	observability.RequestTotal.WithLabelValues(decision.ProviderName, decision.Model, status).Inc()
+
+	observability.TokensTotal.WithLabelValues(decision.ProviderName, decision.Model, "prompt").Add(float64(resp.Usage.PromptTokens))
+	observability.TokensTotal.WithLabelValues(decision.ProviderName, decision.Model, "completion").Add(float64(resp.Usage.CompletionTokens))
+
+	if resp.Provider == "" {
+		resp.Provider = decision.ProviderName
+	}
+
+	if s.cache != nil && level != "fallback_exhausted" {
+		_ = s.cache.Store(ctx, req, resp)
+	}
+
+	return resp, nil
+}
+
+func (s *chatServiceImpl) HandleChatCompletionStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	if !req.Stream {
+		req.Stream = true
+	}
+
+	decision, err := s.router.Route(req)
+	if err != nil {
+		return nil, err
+	}
+
+	if !s.cbManager.Allow(decision.ProviderName, decision.Model) {
+		return nil, model.NewError(model.ErrCodeCircuitOpen,
+			"circuit breaker open for "+decision.ProviderName+"/"+decision.Model)
+	}
+
+	provider := s.providerLookup(decision.ProviderName)
+	if provider == nil {
+		return nil, model.NewError(model.ErrCodeProviderError,
+			"provider not found: "+decision.ProviderName)
+	}
+
+	ch, err := provider.SendStream(ctx, req)
+	if err != nil {
+		s.cbManager.RecordFailure(decision.ProviderName, decision.Model)
+		return nil, err
+	}
+
+	out := make(chan model.StreamChunk)
+	go func() {
+		defer close(out)
+		var gotError bool
+		for chunk := range ch {
+			if chunk.Error != nil {
+				s.cbManager.RecordFailure(decision.ProviderName, decision.Model)
+				gotError = true
+			}
+			out <- chunk
+		}
+		if !gotError {
+			s.cbManager.RecordSuccess(decision.ProviderName, decision.Model)
+		}
+	}()
+
+	return out, nil
+}
+
+func (s *chatServiceImpl) buildSendFn() decision.SendFunc {
+	return func(ctx context.Context, providerName, modelName string) (*model.StandardResponse, error) {
+		provider := s.providerLookup(providerName)
+		if provider == nil {
+			return nil, model.NewError(model.ErrCodeProviderError, "provider not found: "+providerName)
+		}
+
+		if !s.cbManager.Allow(providerName, modelName) {
+			return nil, model.NewError(model.ErrCodeCircuitOpen,
+				"circuit breaker open for "+providerName+"/"+modelName)
+		}
+
+		resp, err := provider.Send(ctx, &model.StandardRequest{
+			Model:       modelName,
+			Messages:    nil,
+			Stream:      false,
+		})
+		if err != nil {
+			s.cbManager.RecordFailure(providerName, modelName)
+			return nil, err
+		}
+
+		s.cbManager.RecordSuccess(providerName, modelName)
+
+		resp.Provider = providerName
+		if resp.Model == "" {
+			resp.Model = modelName
+		}
+		return resp, nil
+	}
+}
+```
+
+> **注：** `buildSendFn` 中的 `StandardRequest` 重建是必要的——Fallback 引擎在降级时传入不同的 `modelName`，`SendMsg` 不保存原始请求体，Provider 需要完整的 `StandardRequest` 来构造 API 请求。实际使用时，可通过闭包捕获原始 `req`，仅替换 `Model` 字段。
+
+- [ ] **步骤 A4：验证测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestChatService' -v
+```
+
+预期：全部 PASS（6 个测试：Success / CacheHit / CircuitBreakerOpen / RouteError / FallbackExhausted / RecordsMetrics）。
+
+---
+
+### 阶段 B：CircuitBreakerManager 实现
+
+- [ ] **步骤 B1：先写熔断管理器测试**
+
+文件： `internal/ingress/service_test.go`（追加 `TestCircuitBreakerManager` 组）
+
+```go
+func TestCircuitBreakerManagerAllowAndRecord(t *testing.T) {
+	mgr := NewCircuitBreakerManager(2, 30*time.Second)
+	require.True(t, mgr.Allow("openai", "gpt-4o"))
+	require.True(t, mgr.Allow("openai", "gpt-4o"))
+	mgr.RecordFailure("openai", "gpt-4o")
+	require.True(t, mgr.Allow("openai", "gpt-4o"))
+	mgr.RecordFailure("openai", "gpt-4o")
+	require.False(t, mgr.Allow("openai", "gpt-4o"))
+}
+
+func TestCircuitBreakerManagerPerProviderModelIsolation(t *testing.T) {
+	mgr := NewCircuitBreakerManager(1, 30*time.Second)
+	mgr.RecordFailure("openai", "gpt-4o")
+	require.True(t, mgr.Allow("deepseek", "deepseek-chat"))
+}
+
+func TestCircuitBreakerManagerRecordSuccessResets(t *testing.T) {
+	mgr := NewCircuitBreakerManager(1, 30*time.Second)
+	mgr.RecordFailure("openai", "gpt-4o")
+	require.False(t, mgr.Allow("openai", "gpt-4o"))
+	mgr.RecordSuccess("openai", "gpt-4o")
+	require.True(t, mgr.Allow("openai", "gpt-4o"))
+}
+
+func TestCircuitBreakerManagerHalfOpenAfterCooldown(t *testing.T) {
+	mgr := NewCircuitBreakerManager(1, 50*time.Millisecond)
+	mgr.RecordFailure("openai", "gpt-4o")
+	require.False(t, mgr.Allow("openai", "gpt-4o"))
+	time.Sleep(60 * time.Millisecond)
+	require.True(t, mgr.Allow("openai", "gpt-4o"))
+}
+```
+
+- [ ] **步骤 B2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestCircuitBreakerManager' -v
+```
+
+预期：失败，提示 `NewCircuitBreakerManager` 未定义。
+
+- [ ] **步骤 B3：实现 CircuitBreakerManager**
+
+文件： `internal/ingress/service.go`（追加）
+
+```go
+import (
+	"sync"
+	"github.com/viif/momu-llmgateway/internal/decision"
+)
+
+type circuitBreakerManagerImpl struct {
+	mu       sync.RWMutex
+	breakers map[string]*decision.CircuitBreaker
+	threshold int
+	cooldown  time.Duration
+}
+
+func NewCircuitBreakerManager(threshold int, cooldown time.Duration) CircuitBreakerManager {
+	return &circuitBreakerManagerImpl{
+		breakers:  make(map[string]*decision.CircuitBreaker),
+		threshold: threshold,
+		cooldown:  cooldown,
+	}
+}
+
+func (m *circuitBreakerManagerImpl) key(provider, model string) string {
+	return provider + "/" + model
+}
+
+func (m *circuitBreakerManagerImpl) getOrCreate(key string) *decision.CircuitBreaker {
+	m.mu.RLock()
+	if cb, ok := m.breakers[key]; ok {
+		m.mu.RUnlock()
+		return cb
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cb, ok := m.breakers[key]; ok {
+		return cb
+	}
+	cb := decision.NewCircuitBreaker(m.threshold, m.cooldown)
+	m.breakers[key] = cb
+	return cb
+}
+
+func (m *circuitBreakerManagerImpl) Allow(provider, model string) bool {
+	return m.getOrCreate(m.key(provider, model)).Allow()
+}
+
+func (m *circuitBreakerManagerImpl) RecordSuccess(provider, model string) {
+	m.getOrCreate(m.key(provider, model)).RecordSuccess()
+}
+
+func (m *circuitBreakerManagerImpl) RecordFailure(provider, model string) {
+	m.getOrCreate(m.key(provider, model)).RecordFailure()
+}
+```
+
+- [ ] **步骤 B4：验证熔断管理器测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestCircuitBreakerManager' -v
+```
+
+预期：全部 PASS（4 个测试）。
+
+---
+
+### 阶段 C：HTTP Handler 集成实现
+
+- [ ] **步骤 C1：先写 Handler 集成测试**
 
 文件： `internal/ingress/handler_test.go`
 
@@ -5917,12 +6509,17 @@ git commit -m "test: 添加中间件链集成测试"
 package ingress
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/decision"
+	"github.com/viif/momu-llmgateway/internal/model"
 )
 
 func TestHealthHandler(t *testing.T) {
@@ -5934,17 +6531,115 @@ func TestHealthHandler(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Body.String(), "ok")
 }
+
+func TestMetricsHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterRoutes(r, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestChatCompletionNonStreaming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o", Strategy: "explicit"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		&mockCache{hit: false},
+		&mockFallback{resp: &model.StandardResponse{ID: "test-1", Model: "gpt-4o", Choices: []model.Choice{{Index: 0, Message: model.Message{Role: "assistant", Content: "hello"}, FinishReason: "stop"}}}, level: "primary"},
+		func(name string) model.Provider { return &mockProvider{name: name} },
+	)
+
+	RegisterRoutes(r, svc)
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	var resp model.StandardResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, "test-1", resp.ID)
+	require.Equal(t, "hello", resp.Choices[0].Message.Content)
+}
+
+func TestChatCompletionNoServiceReturnsNotImplemented(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	RegisterRoutes(r, nil)
+	reqBody, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody)))
+	require.Equal(t, http.StatusNotImplemented, w.Code)
+}
+
+func TestChatCompletionErrorFormatting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	svc := NewChatService(
+		&mockRouter{err: model.NewError(model.ErrCodeModelNotFound, "no providers for this model")},
+		&mockCBManager{},
+		&mockCache{hit: false},
+		nil,
+		nil,
+	)
+	RegisterRoutes(r, svc)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "bad", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody)))
+
+	require.Equal(t, http.StatusBadGateway, w.Code)
+	var errResp struct {
+		Error *model.Error `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	require.NotNil(t, errResp.Error)
+	require.Equal(t, model.ErrCodeModelNotFound, errResp.Error.Code)
+}
+
+func TestChatCompletionCircuitBreakerOpen(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: false}}},
+		&mockCache{hit: false},
+		nil,
+		nil,
+	)
+	RegisterRoutes(r, svc)
+
+	reqBody, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody)))
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	var errResp struct {
+		Error *model.Error `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	require.Equal(t, model.ErrCodeCircuitOpen, errResp.Error.Code)
+}
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [ ] **步骤 C2：运行测试确认失败**
 
 ```bash
-go test ./internal/ingress -run TestHealthHandler -v
+go test ./internal/ingress -run 'TestChatCompletion|TestHealthHandler|TestMetricsHandler' -v
 ```
 
-预期：失败，提示 `RegisterRoutes` 未定义。
+预期：失败或 `TestChatCompletionNonStreaming` 返回 501（`chat service not wired`）。
 
-- [ ] **步骤 3：实现路由注册和基础 Handler**
+- [ ] **步骤 C3：实现完整 Handler（路由注册 + 聊天补全逻辑）**
 
 文件： `internal/ingress/handler.go`
 
@@ -5952,39 +6647,316 @@ go test ./internal/ingress -run TestHealthHandler -v
 package ingress
 
 import (
+	"context"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/viif/momu-llmgateway/internal/model"
+	"github.com/viif/momu-llmgateway/internal/observability"
 )
 
-type ChatService interface{}
-
 func RegisterRoutes(r *gin.Engine, svc ChatService) {
-	r.GET("/health", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) })
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
-	r.POST("/v1/chat/completions", func(c *gin.Context) {
-		c.JSON(http.StatusNotImplemented, gin.H{"error": "chat service not wired"})
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	r.POST("/v1/chat/completions", chatCompletionHandler(svc))
+}
+
+func chatCompletionHandler(svc ChatService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+
+		requestID, _ := c.Get("request_id")
+		if rid, ok := requestID.(string); ok {
+			ctx = observability.WithRequestID(ctx, rid)
+		}
+
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": model.NewError(model.ErrCodeInvalidRequest, "failed to read body")})
+			return
+		}
+
+		req, err := model.ParseStandardRequest(body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": model.NewError(model.ErrCodeInvalidRequest, "invalid request body")})
+			return
+		}
+
+		if rid, ok := requestID.(string); ok {
+			req.RequestID = rid
+		}
+
+		if svc == nil {
+			c.JSON(http.StatusNotImplemented, gin.H{"error": "chat service not wired"})
+			return
+		}
+
+		if req.Stream {
+			handleStream(c, ctx, svc, req)
+			return
+		}
+
+		handleNonStreaming(c, ctx, svc, req)
+	}
+}
+
+func handleNonStreaming(c *gin.Context, ctx context.Context, svc ChatService, req *model.StandardRequest) {
+	resp, err := svc.HandleChatCompletion(ctx, req)
+	if err != nil {
+		statusCode := errorToHTTPStatus(err)
+		c.JSON(statusCode, gin.H{"error": err.(*model.Error)})
+		return
+	}
+
+	if resp.CacheHit {
+		c.Header("X-Cache", "HIT")
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func handleStream(c *gin.Context, ctx context.Context, svc ChatService, req *model.StandardRequest) {
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+	if err != nil {
+		statusCode := errorToHTTPStatus(err)
+		c.JSON(statusCode, gin.H{"error": err.(*model.Error)})
+		return
+	}
+
+	c.Status(http.StatusOK)
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": model.NewError(model.ErrCodeInternal, "streaming not supported")})
+		return
+	}
+
+	for chunk := range ch {
+		if chunk.Error != nil {
+			_ = writeSSEEvent(c.Writer, chunk)
+			flusher.Flush()
+			return
+		}
+		_ = writeSSEEvent(c.Writer, chunk)
+		flusher.Flush()
+	}
+	_ = writeSSEDone(c.Writer)
+	flusher.Flush()
+}
+
+func writeSSEEvent(w io.Writer, chunk model.StreamChunk) error {
+	data, err := chunk.ToJSON()
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append([]byte("data: "), append(data, '\n', '\n')...))
+	return err
+}
+
+func writeSSEDone(w io.Writer) error {
+	_, err := w.Write([]byte("data: [DONE]\n\n"))
+	return err
+}
+
+func errorToHTTPStatus(err error) int {
+	if me, ok := err.(*model.Error); ok {
+		switch me.Code {
+		case model.ErrCodeInvalidRequest, model.ErrCodeModelNotFound:
+			return http.StatusBadRequest
+		case model.ErrCodeAuthentication:
+			return http.StatusUnauthorized
+		case model.ErrCodeRateLimit:
+			return http.StatusTooManyRequests
+		case model.ErrCodeCircuitOpen:
+			return http.StatusServiceUnavailable
+		case model.ErrCodeProviderError, model.ErrCodeTimeout:
+			return http.StatusBadGateway
+		case model.ErrCodeFallbackExhausted:
+			return http.StatusServiceUnavailable
+		default:
+			return http.StatusInternalServerError
+		}
+	}
+	return http.StatusInternalServerError
 }
 ```
 
-- [ ] **步骤 4：验证测试通过**
+> **注：** `model.StreamChunk` 需要新增 `ToJSON()` 方法以支持 SSE 序列化。若 `StreamChunk` 尚不具备此方法，则 handler 中使用 `json.Marshal(chunk)` 替代。
+
+- [ ] **步骤 C4：验证全量 Handler 测试通过**
 
 ```bash
-go test ./internal/ingress -run TestHealthHandler -v
+go test ./internal/ingress -run 'TestHealthHandler|TestMetricsHandler|TestChatCompletion' -v
 ```
 
-预期：PASS。
+预期：全部 PASS（6 个测试：Health + Metrics + NonStreaming + NoService + ErrorFormatting + CBOpen）。
 
-- [ ] **步骤 5：提交**
+---
+
+### 阶段 D：补充 `sendFn` 设计缺陷修复
+
+> **发现问题：** 阶段 A 中 `buildSendFn` 创建的闭包向 Provider.Send 传入了一个仅有 Model 字段的空白 `StandardRequest`，丢失了原始请求的 `Messages`、`Temperature`、`MaxTokens` 等字段，导致 Provider 无法构造有效 API 调用。解决方案：`buildSendFn` 应捕获原始 `req`，只替换 `Model` 字段。
+
+- [ ] **步骤 D1：修复 `HandleChatCompletion` 中的 `sendFn` 构造**
+
+文件： `internal/ingress/service.go`（修改）
+
+将 `HandleChatCompletion` 方法中的：
+
+```go
+sendFn := s.buildSendFn()
+```
+
+改为：
+
+```go
+sendFn := s.buildSendFn(req)
+```
+
+并将 `buildSendFn` 签名和方法体改为：
+
+```go
+func (s *chatServiceImpl) buildSendFn(originalReq *model.StandardRequest) decision.SendFunc {
+	return func(ctx context.Context, providerName, modelName string) (*model.StandardResponse, error) {
+		provider := s.providerLookup(providerName)
+		if provider == nil {
+			return nil, model.NewError(model.ErrCodeProviderError, "provider not found: "+providerName)
+		}
+
+		if !s.cbManager.Allow(providerName, modelName) {
+			return nil, model.NewError(model.ErrCodeCircuitOpen,
+				"circuit breaker open for "+providerName+"/"+modelName)
+		}
+
+		req := *originalReq
+		req.Model = modelName
+		req.Stream = false
+
+		resp, err := provider.Send(ctx, &req)
+		if err != nil {
+			s.cbManager.RecordFailure(providerName, modelName)
+			return nil, err
+		}
+
+		s.cbManager.RecordSuccess(providerName, modelName)
+
+		resp.Provider = providerName
+		if resp.Model == "" {
+			resp.Model = modelName
+		}
+		return resp, nil
+	}
+}
+```
+
+- [ ] **步骤 D2：验证已有测试仍然通过**
 
 ```bash
-git add internal/ingress/handler.go internal/ingress/handler_test.go
-git commit -m "feat: 添加 http 路由处理器"
+go test ./internal/ingress -run 'TestChatService' -v
+```
+
+预期：全部 PASS（6 个测试，测试中 mock 不依赖此字段故不受影响）。
+
+---
+
+### 阶段 E：补充 `StreamChunk.ToJSON()` 方法
+
+> **背景：** `handleStream` 需要将每个 `StreamChunk` 序列化为 `data: {...}\n\n`，`model.StreamChunk` 需具备 `ToJSON()` 方法。
+
+- [ ] **步骤 E1：在 `model/request.go` 中新增 `StreamChunk.ToJSON()`**
+
+文件： `internal/model/request.go`（追加）
+
+```go
+func (s *StreamChunk) ToJSON() ([]byte, error) {
+	return json.Marshal(s)
+}
+```
+
+- [ ] **步骤 E2：验证构建**
+
+```bash
+go build ./...
+```
+
+预期：无错误。
+
+---
+
+### 阶段 F：import 整理与全量验证
+
+- [ ] **步骤 F1：整理 import**
+
+`internal/ingress/service.go` 需要补充 import：
+
+```go
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/viif/momu-llmgateway/internal/decision"
+	"github.com/viif/momu-llmgateway/internal/model"
+	"github.com/viif/momu-llmgateway/internal/observability"
+)
+```
+
+`internal/ingress/handler.go` 需要补充 import：
+
+```go
+import (
+	"context"
+	"io"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/viif/momu-llmgateway/internal/model"
+	"github.com/viif/momu-llmgateway/internal/observability"
+)
+```
+
+- [ ] **步骤 F2：运行全量 ingress 测试**
+
+```bash
+go test ./internal/ingress -v
+```
+
+预期：全部 PASS（包括原有 23 个中间件测试 + 新增 14 个 handler/service 测试 = 37 个测试）。
+
+- [ ] **步骤 F3：运行全量测试**
+
+```bash
+go test ./...
+```
+
+预期：全部 PASS。
+
+- [ ] **步骤 F4：提交**
+
+```bash
+git add internal/ingress/service.go internal/ingress/service_test.go internal/ingress/handler.go internal/ingress/handler_test.go internal/model/request.go
+git commit -m "feat: 实现聊天补全 handler 完整编排"
 ```
 
 ---
+
+### 任务 17 文件清单
+
+| 文件 | 状态 | 职责 |
+|------|------|------|
+| `internal/ingress/service.go` | 新建 | `ChatService` 接口、`chatServiceImpl` 编排、`CircuitBreakerManager` 实现 |
+| `internal/ingress/service_test.go` | 新建 | 编排逻辑单元测试（含 mock，10 个测试） |
+| `internal/ingress/handler.go` | 新建 | 路由注册、非流式/流式 Handler、SSE 写入、错误码映射 |
+| `internal/ingress/handler_test.go` | 新建 | HTTP 集成测试（6 个测试） |
+| `internal/model/request.go` | 修改 | 新增 `StreamChunk.ToJSON()` |
 
 ## 任务 18：在 main.go 中组装服务
 

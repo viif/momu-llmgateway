@@ -34,5 +34,8 @@ go.work.sum
 # claude code
 .claude/settings.local.json
 
+# gateway binary
+/gateway
+
 # embedding model files
 .models/
