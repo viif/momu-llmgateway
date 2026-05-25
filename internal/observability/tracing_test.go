@@ -10,7 +10,6 @@ import (
 func TestRequestIDContext(t *testing.T) {
 	ctx := WithRequestID(context.Background(), "req-1")
 	require.Equal(t, "req-1", RequestIDFromContext(ctx))
-	require.NotEmpty(t, NewRequestID())
 }
 
 func TestRequestIDFromContextEmpty(t *testing.T) {

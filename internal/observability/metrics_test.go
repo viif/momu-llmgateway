@@ -68,7 +68,26 @@ func TestTokensTotalAndFallback(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(TokensTotal, FallbackTotal)
 	TokensTotal.WithLabelValues("openai", "gpt-4o", "prompt").Add(10)
+	TokensTotal.WithLabelValues("openai", "gpt-4o", "completion").Add(5)
 	FallbackTotal.WithLabelValues("retry", "gpt-4o", "gpt-4o-mini").Inc()
+	FallbackTotal.WithLabelValues("chain", "gpt-4o", "deepseek-chat").Inc()
+
+	metricFamily, err := reg.Gather()
+	require.NoError(t, err)
+	foundTokens := false
+	foundFallback := false
+	for _, mf := range metricFamily {
+		switch mf.GetName() {
+		case "llm_tokens_total":
+			foundTokens = true
+			require.Len(t, mf.Metric, 2)
+		case "llm_fallback_total":
+			foundFallback = true
+			require.Len(t, mf.Metric, 2)
+		}
+	}
+	require.True(t, foundTokens, "llm_tokens_total not found")
+	require.True(t, foundFallback, "llm_fallback_total not found")
 }
 
 func TestRequestDurationHistogram(t *testing.T) {
