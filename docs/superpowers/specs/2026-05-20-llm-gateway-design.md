@@ -408,217 +408,47 @@ L4: 返回预设兜底响应 + 错误码
 
 ## 7. 核心数据模型
 
-```go
-type StandardRequest struct {
-    RequestID   string
-    Model       string
-    Messages    []Message
-    Stream      bool
-    Temperature *float64
-    MaxTokens   *int
-    TaskType    string
-    Metadata    map[string]string
-}
+| 类型 | 关键字段 | 说明 |
+|------|---------|------|
+| `StandardRequest` | `RequestID`, `Model`, `Messages`, `Stream`, `Temperature`, `MaxTokens`, `TaskType`, `Metadata` | 网关统一请求体，兼容 OpenAI Chat Completions 格式 |
+| `Message` | `Role` ("system" / "user" / "assistant"), `Content` | 对话消息单元 |
+| `StandardResponse` | `ID`, `Model`, `Provider`, `Choices`, `Usage`, `CacheHit` | 网关统一响应体 |
+| `Choice` | `Index`, `Message`, `FinishReason` | 响应选项 |
+| `Usage` | `PromptTokens`, `CompletionTokens`, `TotalTokens` | Token 用量统计 |
+| `StreamChunk` | `ID`, `Model`, `Delta`, `Done`, `Error` | 流式 SSE 块，含错误字断 |
+| `Delta` | `Role`, `Content` | 流式增量内容 |
+| `Error` | `Code`, `Message`, `Type` | 统一错误码，实现 `error` 接口 |
 
-type Message struct {
-    Role    string
-    Content string
-}
+错误码常量：`invalid_request`、`authentication_error`、`rate_limit_exceeded`、`model_not_found`、`provider_error`、`circuit_breaker_open`、`timeout`、`fallback_exhausted`、`internal_error`。
 
-type StandardResponse struct {
-    ID        string
-    Model     string
-    Provider  string
-    Choices   []Choice
-    Usage     Usage
-    CacheHit  bool
-}
+`Provider` 接口定义见上方 [3. 出口层](#3-出口层-egress-layer)；`EmbeddingProvider` 定义 `Embed(ctx, texts) ([][]float64, error)`。
 
-type Choice struct {
-    Index        int
-    Message      Message
-    FinishReason string
-}
+## 8. 配置文件结构 (gateway.yaml)
 
-type Usage struct {
-    PromptTokens     int
-    CompletionTokens int
-    TotalTokens      int
-}
+配置文件位于 `configs/gateway.yaml`，使用 Viper 加载，`${ENV_VAR}` 占位符在加载时自动展开为环境变量值。以下为各配置段说明：
 
-type StreamChunk struct {
-    ID      string
-    Model   string
-    Delta   Delta
-    Done    bool
-}
-
-type Delta struct {
-    Role    string
-    Content string
-}
-```
-
-## 8. 配置文件 (gateway.yaml)
-
-```yaml
-server:
-  port: 8080
-  read_timeout: 30s
-  write_timeout: 120s
-
-redis:
-  addr: "localhost:6379"
-  password: ""
-  db: 0
-
-auth:
-  api_keys:
-    - key: "sk-xxx"
-      name: "default"
-      rate_limit: 60
-      allowed_models: ["*"]
-
-providers:
-  openai:
-    type: "openai"
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
-    models: ["gpt-4o", "gpt-4o-mini"]
-    weight: 100
-    timeout: 60s
-  anthropic:
-    type: "anthropic"
-    base_url: "https://api.anthropic.com"
-    api_key: "${ANTHROPIC_API_KEY}"
-    models: ["claude-sonnet-4-20250514"]
-    weight: 80
-    timeout: 60s
-  deepseek:
-    type: "openai"
-    base_url: "https://api.deepseek.com/v1"
-    api_key: "${DEEPSEEK_API_KEY}"
-    models: ["deepseek-chat", "deepseek-reasoner"]
-    weight: 90
-    timeout: 60s
-  qwen:
-    type: "openai"
-    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    api_key: "${QWEN_API_KEY}"
-    models: ["qwen-turbo", "qwen-plus", "qwen-max"]
-    weight: 85
-    timeout: 60s
-   glm:
-    type: "openai"
-    base_url: "https://open.bigmodel.cn/api/paas/v4"
-    api_key: "${GLM_API_KEY}"
-    models: ["glm-4", "glm-4-flash"]
-    weight: 75
-    timeout: 60s
-
-routing:
-  strategies: ["explicit", "capability", "semantic", "cost_cascade"]
-  rules:
-    - task_type: "long_context"
-      condition: "input_tokens > 100000"
-      target_models: ["claude-sonnet-4-20250514", "deepseek-chat"]
-  cascade:
-    default: ["deepseek-chat", "gpt-4o-mini", "gpt-4o"]
-
-semantic_routing:
-  similarity_threshold: 0.75
-  categories:
-    - name: "code_generation"
-      target_models: ["deepseek-chat", "gpt-4o"]
-      exemplars:
-        - "Write a Python function that..."
-        - "Generate code to..."
-        - "帮我写一个..."
-    - name: "creative_writing"
-      target_models: ["claude-sonnet-4-20250514", "gpt-4o"]
-      exemplars:
-        - "Write a story about..."
-        - "Create a poem..."
-        - "写一篇关于..."
-    - name: "data_analysis"
-      target_models: ["gpt-4o", "deepseek-chat"]
-      exemplars:
-        - "Analyze this dataset..."
-        - "分析这些数据..."
-
-semantic_cache:
-  enabled: true
-  similarity_threshold: 0.95
-  ttl: 1h
-  max_entries: 10000
-  max_prompt_length: 8192  # 字符数（rune）; 0 表示不限制
-
-fallback:
-  retry_max: 2
-  retry_backoff: "1s"
-  chains:
-    gpt-4o: ["claude-sonnet-4-20250514", "gpt-4o-mini"]
-    claude-sonnet-4-20250514: ["gpt-4o", "deepseek-chat"]
-    deepseek-chat: ["gpt-4o-mini", "qwen-turbo"]
-
-balancer:
-  concurrency_penalty_coefficient: 3.0   # w1, 越大则对并发越敏感
-  latency_penalty_coefficient: 2.0       # w2, 越大则对延迟越敏感
-  warmup_enabled: true
-  warmup_duration: 30s
-  health_window_size: 30s
-  health_min_requests: 10
-
-circuit_breaker:
-  failure_threshold: 5
-  window: 10s
-  cooldown: 30s
-
-embedding:
-  onnx_library_path: "/usr/lib/libonnxruntime.so"
-  model_path: "./.models/bge-small-zh-v1.5"
-```
+| 配置段 | 关键字段 | 说明 |
+|--------|---------|------|
+| `server` | `port`, `read_timeout`, `write_timeout` | HTTP 服务参数，默认 8080 端口 |
+| `redis` | `addr`, `password`, `db` | Redis 连接，用于限流和语义缓存持久化 |
+| `auth.api_keys[]` | `key`, `name`, `rate_limit`, `allowed_models` | 静态 API Key 列表，每 key 可设独立限流配额和模型白名单 |
+| `providers.<name>` | `type` ("openai" / "anthropic"), `base_url`, `api_key`, `models`, `weight`, `timeout` | Provider 注册配置，支持 5 个 Provider：openai、anthropic、deepseek、qwen、glm |
+| `routing` | `strategies` (有序列表), `rules[]` (task_type/condition/target_models), `cascade` (模型级联链) | 路由策略链编排和能力/成本路由规则 |
+| `semantic_routing` | `similarity_threshold`, `categories[]` (name/target_models/exemplars) | 语义路由分类配置，exemplars 用于预计算类别原型向量 |
+| `semantic_cache` | `enabled`, `similarity_threshold`, `ttl`, `max_entries`, `max_prompt_length` | 语义缓存开关和参数，TTL 默认 1h，max_entries 默认 10000 |
+| `fallback` | `retry_max` (默认 2), `retry_backoff`, `chains` (模型 → 备选列表) | L1 重试参数与 L3 跨模型降级链 |
+| `balancer` | `concurrency_penalty_coefficient` (w1), `latency_penalty_coefficient` (w2), `warmup_enabled`, `warmup_duration`, `health_window_size`, `health_min_requests` | 负载均衡权重系数和健康检查参数 |
+| `circuit_breaker` | `failure_threshold` (默认 5), `window` (10s), `cooldown` (30s) | 熔断器阈值和冷却时间 |
+| `embedding` | `onnx_library_path`, `model_path` | 本地 ONNX 嵌入引擎的库路径和模型目录 |
 
 ## 9. GitHub Actions CI
 
-```yaml
-# .github/workflows/ci.yml
-name: CI
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+CI workflow 位于 `.github/workflows/ci.yml`，包含两个 job：
 
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v4
-        with:
-          version: latest
+- **lint**：`gofmt -l .` 格式检查 + `golangci-lint` 静态分析，Go 1.21。
+- **test**：Redis 7 服务容器 + ONNX Runtime 动态库安装 + BGE 模型下载 + `go test -race ./...` 全量竞态检测。
 
-  test:
-    runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - run: go test -race ./...
-```
+不包含 Docker 镜像构建 job。完整 YAML 参照实现文件。
 
 ## 10. 验证方案
 
@@ -637,25 +467,12 @@ jobs:
 - 熔断 + 降级场景验证
 
 ### 手动验证
-```bash
-# 启动服务
-go run cmd/gateway/main.go
 
-# 普通请求
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+参考实施计划任务 21 的冒烟检查清单，核心验证命令：
 
-# 流式请求
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-xxx" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-
-# 检查 Prometheus 指标
-curl http://localhost:8080/metrics
-
-# 健康检查
-curl http://localhost:8080/health
-```
+- 启动服务：`GATEWAY_CONFIG=configs/gateway.yaml go run ./cmd/gateway`
+- 健康检查：`curl http://localhost:8080/health` → 预期 `{"status":"ok"}`
+- 指标端点：`curl http://localhost:8080/metrics` → 预期 Prometheus 格式输出
+- 普通请求：`POST /v1/chat/completions` with `Authorization: Bearer sk-xxx`，预期 200 或上游错误（非 401）
+- 流式请求：同上加 `"stream":true`，预期 SSE 流式响应以 `data: [DONE]` 结束
+- 认证失败：无 Authorization / 错误 Key / 非 Bearer 前缀 → 预期 401
