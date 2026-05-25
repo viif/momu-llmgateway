@@ -1,6 +1,9 @@
 package egress
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -29,4 +32,21 @@ func TestParseSSELine(t *testing.T) {
 
 	_, _, err = parseSSELine(strings.TrimSpace(""))
 	require.NoError(t, err)
+}
+
+func TestOpenAIHealthCheckSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAICompatible("openai", srv.URL, "sk-test", []string{"gpt-4o"}, 2*time.Second)
+	err := p.HealthCheck(context.Background())
+	require.NoError(t, err)
+}
+
+func TestOpenAIHealthCheckUnreachable(t *testing.T) {
+	p := NewOpenAICompatible("openai", "http://127.0.0.1:19999", "sk-test", []string{"gpt-4o"}, 500*time.Millisecond)
+	err := p.HealthCheck(context.Background())
+	require.Error(t, err)
 }

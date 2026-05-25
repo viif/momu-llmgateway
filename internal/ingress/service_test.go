@@ -29,6 +29,8 @@ func (m *mockProvider) SendStream(ctx context.Context, req *model.StandardReques
 	return ch, nil
 }
 
+func (m *mockProvider) HealthCheck(ctx context.Context) error { return nil }
+
 type mockRouter struct {
 	decision decision.RouteDecision
 	err      error

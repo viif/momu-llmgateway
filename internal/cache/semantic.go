@@ -22,6 +22,7 @@ type Embedder interface {
 type CacheStore interface {
 	Save(ctx context.Context, model, key string, vector []float64, respJSON []byte, ttl time.Duration) error
 	LoadAll(ctx context.Context, model string) ([]CacheEntry, error)
+	Ping(ctx context.Context) error
 	Close() error
 }
 

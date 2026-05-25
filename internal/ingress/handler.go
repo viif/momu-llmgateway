@@ -11,8 +11,13 @@ import (
 	"github.com/viif/momu-llmgateway/internal/observability"
 )
 
-func RegisterRoutes(r *gin.Engine, svc ChatService) {
+func RegisterRoutes(r *gin.Engine, svc ChatService, checker *HealthChecker) {
 	r.GET("/health", func(c *gin.Context) {
+		if checker != nil {
+			result := checker.Check(c.Request.Context())
+			c.JSON(http.StatusOK, result)
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))

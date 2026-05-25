@@ -22,6 +22,7 @@ func (f fakeProvider) Send(context.Context, *model.StandardRequest) (*model.Stan
 func (f fakeProvider) SendStream(context.Context, *model.StandardRequest) (<-chan model.StreamChunk, error) {
 	return nil, nil
 }
+func (f fakeProvider) HealthCheck(ctx context.Context) error { return nil }
 
 func TestRegistryFindsProvidersByModel(t *testing.T) {
 	r := NewRegistry()

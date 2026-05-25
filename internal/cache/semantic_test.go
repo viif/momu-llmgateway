@@ -233,6 +233,8 @@ func (f *fakeStore) LoadAll(ctx context.Context, model string) ([]CacheEntry, er
 	return f.entries[model], nil
 }
 
+func (f *fakeStore) Ping(ctx context.Context) error { return nil }
+
 func (f *fakeStore) Close() error { return nil }
 
 func TestLoadFromStoreRecoversEntries(t *testing.T) {

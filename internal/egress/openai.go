@@ -29,6 +29,21 @@ func (p *OpenAICompatible) Name() string { return p.name }
 
 func (p *OpenAICompatible) Models() []string { return p.models }
 
+func (p *OpenAICompatible) HealthCheck(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
+}
+
 func (p *OpenAICompatible) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
 	body := map[string]any{
 		"model":    req.Model,

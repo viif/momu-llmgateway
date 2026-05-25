@@ -54,6 +54,12 @@ func TestRedisStoreTTLExpiry(t *testing.T) {
 	require.Empty(t, entries)
 }
 
+func TestRedisStorePing(t *testing.T) {
+	store, _ := newTestRedis(t)
+	defer func() { _ = store.Close() }()
+	require.NoError(t, store.Ping(context.Background()))
+}
+
 func TestRedisStoreMultipleEntries(t *testing.T) {
 	store, _ := newTestRedis(t)
 	defer func() { _ = store.Close() }()

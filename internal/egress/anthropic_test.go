@@ -1,6 +1,9 @@
 package egress
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -39,4 +42,21 @@ func TestAnthropicParseSSEEvent(t *testing.T) {
 
 	_, _, err = parseAnthropicSSEEvent("", "")
 	require.NoError(t, err)
+}
+
+func TestAnthropicHealthCheckSuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	p := NewAnthropic("anthropic", srv.URL, "sk", []string{"claude-sonnet-4-20250514"}, 2*time.Second)
+	err := p.HealthCheck(context.Background())
+	require.NoError(t, err)
+}
+
+func TestAnthropicHealthCheckUnreachable(t *testing.T) {
+	p := NewAnthropic("anthropic", "http://127.0.0.1:19999", "sk", []string{"claude-sonnet-4-20250514"}, 500*time.Millisecond)
+	err := p.HealthCheck(context.Background())
+	require.Error(t, err)
 }

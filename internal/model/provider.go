@@ -7,6 +7,7 @@ type Provider interface {
 	Send(ctx context.Context, req *StandardRequest) (*StandardResponse, error)
 	SendStream(ctx context.Context, req *StandardRequest) (<-chan StreamChunk, error)
 	Models() []string
+	HealthCheck(ctx context.Context) error
 }
 
 type EmbeddingProvider interface {

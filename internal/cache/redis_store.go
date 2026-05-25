@@ -83,3 +83,7 @@ func (r *RedisStore) LoadAll(ctx context.Context, model string) ([]CacheEntry, e
 func (r *RedisStore) Close() error {
 	return r.client.Close()
 }
+
+func (r *RedisStore) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}

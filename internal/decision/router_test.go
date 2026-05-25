@@ -22,6 +22,7 @@ func (f fakeRegProvider) Send(context.Context, *model.StandardRequest) (*model.S
 func (f fakeRegProvider) SendStream(context.Context, *model.StandardRequest) (<-chan model.StreamChunk, error) {
 	return nil, nil
 }
+func (f fakeRegProvider) HealthCheck(ctx context.Context) error { return nil }
 
 func TestRouterExplicitRoute(t *testing.T) {
 	r := NewRouter(RouterConfig{Strategies: []string{"semantic"}}, nil, nil, nil, nil, nil, nil)

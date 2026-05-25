@@ -28,6 +28,21 @@ func (p *Anthropic) Name() string { return p.name }
 
 func (p *Anthropic) Models() []string { return p.models }
 
+func (p *Anthropic) HealthCheck(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
+}
+
 func (p *Anthropic) buildRequestBody(req *model.StandardRequest) ([]byte, error) {
 	system := ""
 	messages := make([]model.Message, 0, len(req.Messages))

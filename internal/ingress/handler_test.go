@@ -16,17 +16,33 @@ import (
 func TestHealthHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterRoutes(r, nil)
+	RegisterRoutes(r, nil, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Contains(t, w.Body.String(), "ok")
 }
 
+func TestHealthHandlerWithChecker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	store := &pingableStore{}
+	checker := NewHealthChecker(store, nil)
+	RegisterRoutes(r, nil, checker)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var result HealthResult
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &result))
+	require.Equal(t, "ok", result.Status)
+	require.Equal(t, "ok", result.Checks["redis"].Status)
+}
+
 func TestMetricsHandler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterRoutes(r, nil)
+	RegisterRoutes(r, nil, nil)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	require.Equal(t, http.StatusOK, w.Code)
@@ -44,7 +60,7 @@ func TestChatCompletionNonStreaming(t *testing.T) {
 		func(name string) model.Provider { return &mockProvider{name: name} },
 	)
 
-	RegisterRoutes(r, svc)
+	RegisterRoutes(r, svc, nil)
 
 	reqBody, _ := json.Marshal(map[string]any{
 		"model":    "gpt-4o",
@@ -65,7 +81,7 @@ func TestChatCompletionNonStreaming(t *testing.T) {
 func TestChatCompletionNoServiceReturnsNotImplemented(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterRoutes(r, nil)
+	RegisterRoutes(r, nil, nil)
 	reqBody, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(reqBody)))
@@ -82,7 +98,7 @@ func TestChatCompletionErrorFormatting(t *testing.T) {
 		nil,
 		nil,
 	)
-	RegisterRoutes(r, svc)
+	RegisterRoutes(r, svc, nil)
 
 	reqBody, _ := json.Marshal(map[string]any{"model": "bad", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
 	w := httptest.NewRecorder()
@@ -107,7 +123,7 @@ func TestChatCompletionCircuitBreakerOpen(t *testing.T) {
 		nil,
 		nil,
 	)
-	RegisterRoutes(r, svc)
+	RegisterRoutes(r, svc, nil)
 
 	reqBody, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
 	w := httptest.NewRecorder()

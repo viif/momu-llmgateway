@@ -212,7 +212,10 @@ func main() {
 		observability.CacheHitTotal,
 	)
 
-	// ── 14. HTTP 服务 ────────────────────────────────────────
+	// ── 14. 健康检查器 ──────────────────────────────────────
+	healthChecker := ingress.NewHealthChecker(cacheStore, registry)
+
+	// ── 15. HTTP 服务 ────────────────────────────────────────
 	allModels := collectAllModels(cfg.Providers)
 
 	r := gin.New()
@@ -224,7 +227,7 @@ func main() {
 		ingress.RateLimitMiddleware(redisClient),
 		ingress.ValidationMiddleware(allModels),
 	)
-	ingress.RegisterRoutes(r, chatSvc)
+	ingress.RegisterRoutes(r, chatSvc, healthChecker)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
@@ -240,7 +243,7 @@ func main() {
 		}
 	}()
 
-	// ── 15. 优雅关闭 ─────────────────────────────────────────
+	// ── 16. 优雅关闭 ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
