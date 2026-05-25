@@ -336,7 +336,7 @@ circuit_breaker:
 
 平滑动态加权负载均衡（SWRR），有效权重公式：
 
-$$W_{\text{eff}} = W_{\text{base}} \cdot F_{\text{warmup}} \cdot \frac{1}{1 + w_1 \!\cdot\! R_{\text{active}} + w_2 \!\cdot\! L_{p99}} \cdot S_{\text{health}}$$
+$$W_{\text{eff}} = W_{\text{base}} \cdot F_{\text{warmup}} \cdot \frac{1}{1 + w_1 \cdot R_{\text{active}} + w_2 \cdot L_{p99}} \cdot S_{\text{health}}$$
 
 ```yaml
 balancer:
