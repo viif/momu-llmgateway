@@ -46,7 +46,9 @@ func (p *OpenAICompatible) buildRequestBody(req *model.StandardRequest) ([]byte,
 
 func (p *OpenAICompatible) Send(ctx context.Context, req *model.StandardRequest) (*model.StandardResponse, error) {
 	body, err := p.buildRequestBody(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, err

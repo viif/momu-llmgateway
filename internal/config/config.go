@@ -61,7 +61,7 @@ type ProviderConfig struct {
 type RoutingConfig struct {
 	Strategies []string            `mapstructure:"strategies"`
 	Rules      []RoutingRuleConfig `mapstructure:"rules"`
-	Cascade   map[string][]string `mapstructure:"-"`
+	Cascade    map[string][]string `mapstructure:"-"`
 }
 
 type RoutingRuleConfig struct {
@@ -92,7 +92,7 @@ type SemanticCacheConfig struct {
 type FallbackConfig struct {
 	RetryMax     int                 `mapstructure:"retry_max"`
 	RetryBackoff time.Duration       `mapstructure:"retry_backoff"`
-	Chains      map[string][]string `mapstructure:"-"`
+	Chains       map[string][]string `mapstructure:"-"`
 }
 
 type CircuitBreakerConfig struct {
