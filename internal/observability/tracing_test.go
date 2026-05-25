@@ -12,3 +12,17 @@ func TestRequestIDContext(t *testing.T) {
 	require.Equal(t, "req-1", RequestIDFromContext(ctx))
 	require.NotEmpty(t, NewRequestID())
 }
+
+func TestRequestIDFromContextEmpty(t *testing.T) {
+	require.Empty(t, RequestIDFromContext(context.Background()))
+}
+
+func TestNewRequestIDMultipleUnique(t *testing.T) {
+	ids := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		id := NewRequestID()
+		require.NotEmpty(t, id)
+		require.False(t, ids[id], "duplicate ID: %s", id)
+		ids[id] = true
+	}
+}
