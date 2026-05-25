@@ -5,7 +5,7 @@
 仓库已进入实现阶段。设计文档和分步实施计划：
 
 - `docs/superpowers/specs/2026-05-20-llm-gateway-design.md` — 产品与架构设计文档
-- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（20 个任务、按 TDD 逐项实施）
+- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（21 个任务、按 TDD 逐项实施）
 
 ### 实施进度
 
@@ -23,7 +23,8 @@
 - [x] 任务 12：实现本地嵌入引擎 — `internal/embedding/embedding.go`、`engine.go`、`onnx.go`
 - [x] 任务 13：实现路由策略链 — `internal/decision/router.go`、`strategy_semantic.go`、`strategy_capability.go`、`strategy_cost.go`
 - [x] 任务 14：实现语义缓存 — `internal/cache/semantic.go`、`redis_store.go`
-- [ ] 任务 15-21：待依次执行
+- [x] 任务 15：实现 Fallback 引擎 — `internal/fallback/engine.go`、`engine_test.go`
+- [ ] 任务 16-21：待依次执行
 
 ### 实现约束
 

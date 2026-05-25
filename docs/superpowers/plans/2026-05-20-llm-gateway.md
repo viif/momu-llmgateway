@@ -4413,11 +4413,27 @@ func (h *Handler) HandleChat(c *gin.Context) {
 
 ## 任务 15：实现 Fallback 引擎
 
+> **设计参考：** `docs/superpowers/specs/2026-05-20-llm-gateway-design.md` 第 5 节"容错与高可用"。
+
+Fallback 引擎实现四层降级体系，职责边界：
+- **L1（同实例重试）**：引擎提供退避策略，Handler 侧调用 `Send` 时执行重试
+- **L2（跨 Provider 降级）**：由 Handler 层利用 Registry + Balancer 尝试同模型的不同 Provider
+- **L3（跨模型降级）**：引擎提供 `Chain(model)` 返回备选模型列表，Handler 逐项尝试
+- **L4（兜底响应）**：引擎提供 `DefaultResponse()` 构造预设的错误回复
+
+引擎自身不持有 Provider 引用，通过函数注入解耦：
+
+```go
+type SendFunc func(ctx context.Context, providerName, model string) (*model.StandardResponse, error)
+```
+
 **文件：**
 - 新建： `internal/fallback/engine.go`
 - 新建： `internal/fallback/engine_test.go`
 
-- [ ] **步骤 1：先写降级链测试**
+---
+
+- [ ] **步骤 1a：先写链查询与 Attempt 枚举测试**
 
 文件： `internal/fallback/engine_test.go`
 
@@ -4425,59 +4441,398 @@ func (h *Handler) HandleChat(c *gin.Context) {
 package fallback
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/model"
 )
 
-func TestFallbackChain(t *testing.T) {
-	e := NewEngine(map[string][]string{"gpt-4o": {"claude-sonnet-4-20250514", "gpt-4o-mini"}})
-	require.Equal(t, []string{"claude-sonnet-4-20250514", "gpt-4o-mini"}, e.Chain("gpt-4o"))
+func TestChainReturnsDefensiveCopy(t *testing.T) {
+	e := NewEngine(map[string][]string{
+		"gpt-4o": {"claude-sonnet-4-20250514", "gpt-4o-mini"},
+	}, 2, time.Second, "")
+
+	chain := e.Chain("gpt-4o")
+	require.Equal(t, []string{"claude-sonnet-4-20250514", "gpt-4o-mini"}, chain)
 	require.Empty(t, e.Chain("unknown"))
+
+	chain[0] = "modified"
+	require.Equal(t, "claude-sonnet-4-20250514", e.Chain("gpt-4o")[0])
+}
+
+func TestAttemptsIncludesRetriesAndChain(t *testing.T) {
+	e := NewEngine(map[string][]string{
+		"gpt-4o": {"claude-sonnet-4-20250514", "gpt-4o-mini"},
+	}, 2, time.Second, "")
+
+	attempts := e.Attempts("openai", "gpt-4o")
+	require.Len(t, attempts, 5) // primary + 2 retries + 2 chain
+
+	require.Equal(t, "primary", attempts[0].Level)
+	require.Equal(t, "openai", attempts[0].ProviderName)
+	require.Equal(t, "gpt-4o", attempts[0].Model)
+
+	require.Equal(t, "retry", attempts[1].Level)
+	require.Equal(t, attempts[0].ProviderName, attempts[1].ProviderName)
+	require.Equal(t, attempts[0].Model, attempts[1].Model)
+
+	require.Equal(t, "retry", attempts[2].Level)
+
+	require.Equal(t, "fallback", attempts[3].Level)
+	require.Equal(t, "", attempts[3].ProviderName) // caller resolves provider
+
+	require.Equal(t, "fallback", attempts[4].Level)
+}
+
+func TestAttemptsNoChainDefaultRetries(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "") // zero retry -> use default (2)
+	attempts := e.Attempts("openai", "gpt-4o")
+	require.Len(t, attempts, 3) // primary + 2 default retries
+}
+
+func TestAttemptsCustomRetryCount(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "")
+	attempts := e.Attempts("openai", "gpt-4o")
+	require.Len(t, attempts, 3)
+}
+
+func TestAttemptsEmptyChainsNil(t *testing.T) {
+	e := NewEngine(nil, 2, time.Second, "")
+	attempts := e.Attempts("openai", "no-fallback-model")
+	require.Len(t, attempts, 3)
+}
+
+func TestDefaultResponse(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "所有服务暂时不可用，请稍后重试。")
+	resp := e.DefaultResponse()
+	require.Len(t, resp.Choices, 1)
+	require.Equal(t, "assistant", resp.Choices[0].Message.Role)
+	require.Equal(t, "所有服务暂时不可用，请稍后重试。", resp.Choices[0].Message.Content)
+	require.Equal(t, "stop", resp.Choices[0].FinishReason)
+}
+
+func TestDefaultResponseBuiltin(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "")
+	resp := e.DefaultResponse()
+	require.NotEmpty(t, resp.Choices[0].Message.Content)
+}
+
+func TestIsRetryable(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "")
+	require.True(t, e.IsRetryable(errors.New("connection refused")))
+	require.True(t, e.IsRetryable(errors.New("read tcp: i/o timeout")))
+	require.True(t, e.IsRetryable(errors.New("context deadline exceeded")))
+	require.True(t, e.IsRetryable(errors.New("unexpected EOF")))
+	require.False(t, e.IsRetryable(nil))
+	require.False(t, e.IsRetryable(model.NewError(model.ErrCodeInvalidRequest, "bad")))
+	require.False(t, e.IsRetryable(model.NewError(model.ErrCodeAuthentication, "unauthorized")))
+}
+
+func TestBackoffDuration(t *testing.T) {
+	e := NewEngine(nil, 2, 500*time.Millisecond, "")
+	require.Equal(t, 500*time.Millisecond, e.BackoffDuration(0))
+	require.Equal(t, 1*time.Second, e.BackoffDuration(1))
+	require.Equal(t, 2*time.Second, e.BackoffDuration(2))
+}
+
+func TestExecutePrimarySuccess(t *testing.T) {
+	e := NewEngine(nil, 2, time.Millisecond, "fallback")
+	sendCalled := false
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		sendCalled = true
+		return &model.StandardResponse{ID: "ok", Model: model, Provider: provider}, nil
+	}
+	resp, level, err := e.Execute(context.Background(), "openai", "gpt-4o", sendFn)
+	require.NoError(t, err)
+	require.True(t, sendCalled)
+	require.Equal(t, "ok", resp.ID)
+	require.Equal(t, "primary", level)
+}
+
+func TestExecuteRetryOnFailure(t *testing.T) {
+	e := NewEngine(nil, 2, time.Millisecond, "fallback")
+	callCount := 0
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		callCount++
+		if callCount <= 2 {
+			return nil, errors.New("connection refused")
+		}
+		return &model.StandardResponse{ID: "recovered"}, nil
+	}
+	resp, level, err := e.Execute(context.Background(), "openai", "gpt-4o", sendFn)
+	require.NoError(t, err)
+	require.Equal(t, 3, callCount)
+	require.Equal(t, "retry", level)
+	require.Equal(t, "recovered", resp.ID)
+}
+
+func TestExecuteNonRetryableSkipsRetries(t *testing.T) {
+	e := NewEngine(map[string][]string{"gpt-4o": {"gpt-4o-mini"}}, 2, time.Millisecond, "fallback")
+	callCount := 0
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		callCount++
+		if model == "gpt-4o" {
+			return nil, model.NewError(model.ErrCodeInvalidRequest, "bad request")
+		}
+		return &model.StandardResponse{ID: "fallback-ok"}, nil
+	}
+	resp, level, err := e.Execute(context.Background(), "openai", "gpt-4o", sendFn)
+	require.NoError(t, err)
+	require.Equal(t, 2, callCount) // primary (non-retryable) + fallback
+	require.Equal(t, "fallback", level)
+	require.Equal(t, "fallback-ok", resp.ID)
+}
+
+func TestExecuteChainFallback(t *testing.T) {
+	e := NewEngine(map[string][]string{
+		"gpt-4o": {"gpt-4o-mini", "deepseek-chat"},
+	}, 0, time.Millisecond, "unavailable")
+
+	callCount := 0
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		callCount++
+		if model == "gpt-4o" || model == "gpt-4o-mini" {
+			return nil, errors.New("timeout")
+		}
+		return &model.StandardResponse{ID: "deepseek-ok", Model: model, Provider: provider}, nil
+	}
+
+	resp, level, err := e.Execute(context.Background(), "openai", "gpt-4o", sendFn)
+	require.NoError(t, err)
+	require.Equal(t, 3, callCount)
+	require.Equal(t, "fallback", level)
+	require.Equal(t, "deepseek-ok", resp.ID)
+}
+
+func TestExecuteExhaustedReturnsDefault(t *testing.T) {
+	e := NewEngine(map[string][]string{
+		"gpt-4o": {"gpt-4o-mini"},
+	}, 0, time.Millisecond, "all providers down")
+
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		return nil, errors.New("timeout")
+	}
+
+	resp, level, err := e.Execute(context.Background(), "openai", "gpt-4o", sendFn)
+	require.NoError(t, err)
+	require.Equal(t, "fallback_exhausted", level)
+	require.Equal(t, "all providers down", resp.Choices[0].Message.Content)
+}
+
+func TestExecuteContextCancelled(t *testing.T) {
+	e := NewEngine(map[string][]string{"gpt-4o": {"gpt-4o-mini"}}, 2, time.Millisecond, "fallback")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before execution
+
+	sendFn := func(ctx context.Context, provider, model string) (*model.StandardResponse, error) {
+		return nil, ctx.Err()
+	}
+
+	_, _, err := e.Execute(ctx, "openai", "gpt-4o", sendFn)
+	require.Error(t, err)
+}
+
+func TestExecuteEmptySendFunc(t *testing.T) {
+	e := NewEngine(nil, 0, 0, "fallback")
+	_, _, err := e.Execute(context.Background(), "openai", "gpt-4o", nil)
+	require.Error(t, err)
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [ ] **步骤 1b：运行测试确认失败**
 
 ```bash
-go test ./internal/fallback -run TestFallbackChain -v
+go test ./internal/fallback -run 'Test(Chain|Attempts|DefaultResponse|IsRetryable|BackoffDuration|Execute)' -v
 ```
 
-预期：失败，提示 `NewEngine` 未定义。
+预期：全部失败，提示 `NewEngine`、`Attempt`、`SendFunc` 等未定义。
 
-- [ ] **步骤 3：实现 Fallback 引擎**
+- [ ] **步骤 2：实现 Fallback 引擎**
 
 文件： `internal/fallback/engine.go`
 
 ```go
 package fallback
 
-type Engine struct { chains map[string][]string }
+import (
+	"context"
+	"errors"
+	"math"
+	"strings"
+	"time"
 
-func NewEngine(chains map[string][]string) *Engine { return &Engine{chains: chains} }
+	"github.com/viif/momu-llmgateway/internal/model"
+)
 
-func (e *Engine) Chain(model string) []string { return append([]string(nil), e.chains[model]...) }
+const (
+	defaultRetryMax          = 2
+	defaultRetryBackoff      = time.Second
+	defaultFallbackMessage   = "所有模型服务暂时不可用，请稍后重试。"
+)
 
-func (e *Engine) Attempts(primary string) []string {
-	out := []string{primary}
-	out = append(out, e.Chain(primary)...)
+var retryableErrors = []string{
+	"connection refused",
+	"connection reset",
+	"i/o timeout",
+	"deadline exceeded",
+	"unexpected EOF",
+	"no such host",
+}
+
+type Attempt struct {
+	ProviderName string
+	Model        string
+	Level        string
+}
+
+type SendFunc func(ctx context.Context, providerName, model string) (*model.StandardResponse, error)
+
+type Engine struct {
+	chains       map[string][]string
+	retryMax     int
+	retryBackoff time.Duration
+	defaultMsg   string
+}
+
+func NewEngine(chains map[string][]string, retryMax int, retryBackoff time.Duration, defaultMsg string) *Engine {
+	if retryMax <= 0 {
+		retryMax = defaultRetryMax
+	}
+	if retryBackoff <= 0 {
+		retryBackoff = defaultRetryBackoff
+	}
+	if defaultMsg == "" {
+		defaultMsg = defaultFallbackMessage
+	}
+	if chains == nil {
+		chains = make(map[string][]string)
+	}
+	return &Engine{
+		chains:       chains,
+		retryMax:     retryMax,
+		retryBackoff: retryBackoff,
+		defaultMsg:   defaultMsg,
+	}
+}
+
+func (e *Engine) Chain(model string) []string {
+	chain := e.chains[model]
+	out := make([]string, len(chain))
+	copy(out, chain)
 	return out
+}
+
+func (e *Engine) Attempts(providerName, model string) []Attempt {
+	out := []Attempt{{ProviderName: providerName, Model: model, Level: "primary"}}
+	for i := 0; i < e.retryMax; i++ {
+		out = append(out, Attempt{
+			ProviderName: providerName,
+			Model:        model,
+			Level:        "retry",
+		})
+	}
+	for _, m := range e.Chain(model) {
+		out = append(out, Attempt{Model: m, Level: "fallback"})
+	}
+	return out
+}
+
+func (e *Engine) DefaultResponse() *model.StandardResponse {
+	return &model.StandardResponse{
+		Choices: []model.Choice{{
+			Index:        0,
+			Message:      model.Message{Role: "assistant", Content: e.defaultMsg},
+			FinishReason: "stop",
+		}},
+	}
+}
+
+func (e *Engine) IsRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if me, ok := err.(*model.Error); ok {
+		switch me.Code {
+		case model.ErrCodeInvalidRequest,
+			model.ErrCodeAuthentication,
+			model.ErrCodeRateLimit,
+			model.ErrCodeModelNotFound:
+			return false
+		}
+		if me.Code == model.ErrCodeProviderError ||
+			me.Code == model.ErrCodeTimeout ||
+			me.Code == model.ErrCodeCircuitOpen {
+			return true
+		}
+	}
+	msg := err.Error()
+	for _, pattern := range retryableErrors {
+		if strings.Contains(strings.ToLower(msg), pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Engine) BackoffDuration(attempt int) time.Duration {
+	return time.Duration(float64(e.retryBackoff) * math.Pow(2, float64(attempt)))
+}
+
+func (e *Engine) Execute(ctx context.Context, providerName, model string, sendFn SendFunc) (*model.StandardResponse, string, error) {
+	if sendFn == nil {
+		return nil, "", model.NewError(model.ErrCodeInternal, "send function is nil")
+	}
+
+	retryAttempt := 0
+	for _, att := range e.Attempts(providerName, model) {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		if att.Level == "retry" {
+			select {
+			case <-ctx.Done():
+				return nil, "", ctx.Err()
+			case <-time.After(e.BackoffDuration(retryAttempt)):
+			}
+			retryAttempt++
+		}
+		resp, err := sendFn(ctx, att.ProviderName, att.Model)
+		if err == nil {
+			return resp, att.Level, nil
+		}
+		if att.Level == "primary" && !e.IsRetryable(err) {
+			continue
+		}
+	}
+
+	return e.DefaultResponse(), "fallback_exhausted", nil
 }
 ```
 
-- [ ] **步骤 4：验证测试通过**
+> **设计说明：**
+> - `Attempts` 输出完整尝试计划（L1 primary + L1 retry * N + L3 chain），供外部分步调用时枚举。
+> - `Execute` 将重试+链式降级封装为一次调用，Handler 只需传入 `SendFunc` 即可获得结果。
+> - `IsRetryable` 根据错误码和错误消息判断该错误是否可重试：认证/参数/模型不存在类错误直接跳过 L1 重试，进入 L2/L3 降级。
+> - `BackoffDuration` 实现指数退避：`base_duration * 2^attempt`。
+> - `Execute` 中的 `SendFunc` 接收 `providerName` 和 `model`；L3 fallback 的 `ProviderName` 为空字符串，由调用方通过 Registry 解析并传入。
+> - Engine 不持有 Registry/Balancer 引用，保持纯逻辑层关注点分离。
+
+- [ ] **步骤 3：验证全量测试通过**
 
 ```bash
-go test ./internal/fallback -run TestFallbackChain -v
+go test ./internal/fallback -v
 ```
 
-预期：PASS。
+预期：全部 14 个测试 PASS。
 
-- [ ] **步骤 5：提交**
+- [ ] **步骤 4：提交**
 
 ```bash
 git add internal/fallback
-git commit -m "feat: 添加 fallback 降级引擎"
+git commit -m "feat: 实现 fallback 四层降级引擎"
 ```
 
 ---
