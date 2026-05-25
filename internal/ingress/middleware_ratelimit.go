@@ -13,6 +13,11 @@ import (
 
 func RateLimitMiddleware(client *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if path == "/health" || path == "/metrics" {
+			c.Next()
+			return
+		}
 		keyRaw, exists := c.Get("api_key")
 		if !exists || client == nil {
 			c.Next()

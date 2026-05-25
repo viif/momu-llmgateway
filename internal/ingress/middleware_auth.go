@@ -17,6 +17,11 @@ func AuthMiddleware(keys []config.APIKeyConfig) gin.HandlerFunc {
 		allowed[k.Key] = k
 	}
 	return func(c *gin.Context) {
+		path := c.Request.URL.Path
+		if path == "/health" || path == "/metrics" {
+			c.Next()
+			return
+		}
 		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		cfg, ok := allowed[token]
 		if !ok || token == "" || token == c.GetHeader("Authorization") {
