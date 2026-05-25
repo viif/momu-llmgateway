@@ -7619,7 +7619,41 @@ curl -i -X POST http://localhost:8080/v1/chat/completions \
 
 预期：返回 200 或上游 Provider 错误（取决于是否配置了有效的 API Key）。认证中间件不应返回 `401`。若无有效 API Key，预期为 `502 Bad Gateway`。
 
-- [ ] **步骤 6：提交最终验证修正**
+- [ ] **步骤 6：流式请求验证**
+
+```bash
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+预期：返回 SSE 流式响应（`Content-Type: text/event-stream`），逐块推送 `data:` 行，以 `data: [DONE]` 结束。
+
+- [ ] **步骤 7：认证失败场景验证**
+
+```bash
+# 无 Authorization 头 → 401
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+
+# 错误 API Key → 401
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer sk-invalid" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+
+# 非 Bearer 前缀 → 401
+curl -i -X POST http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Basic sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+预期：全部返回 `401 Unauthorized`，响应体包含 `invalid api key` 错误信息。
+
+- [ ] **步骤 8：提交最终验证修正**
 
 如果本任务发现并修复了代码问题，提交：
 
