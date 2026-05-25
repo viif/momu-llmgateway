@@ -34,9 +34,11 @@
 - `internal/embedding/engine.go`：`EmbeddingEngine` 类型和单例生命周期管理。
 - `internal/embedding/onnx.go`：ONNX 嵌入引擎实现（`onnxruntime_go` + 纯 Go tokenizer `hftokenizer`），提供 `Init()` / `Embed()` / `Close()`。
 - `internal/fallback/engine.go`：L1 重试、L2 跨 Provider、L3 跨模型、L4 兜底响应。
+- `internal/ingress/middleware_requestid.go`：RequestID 注入中间件，为每个请求生成唯一 ID 并注入 context 和响应头。
 - `internal/ingress/middleware_auth.go`：Bearer API Key 认证和 allowed_models 校验。
-- `internal/ingress/middleware_ratelimit.go`：Redis 滑动窗口限流。
-- `internal/ingress/middleware_logging.go`：请求日志和延迟记录。
+- `internal/ingress/middleware_ratelimit.go`：Redis 滑动窗口限流（ZRANGEBYSCORE + ZADD），按 API Key 独立计数。
+- `internal/ingress/middleware_validation.go`：请求参数校验（model 非空、messages 非空、temperature 范围、max_tokens 合法性）。
+- `internal/ingress/middleware_logging.go`：请求日志，记录 request_id、path、method、status、latency、content_length 等结构化字段。
 - `internal/ingress/handler.go`：`POST /v1/chat/completions`、`GET /health`、`GET /metrics`。
 - `configs/gateway.yaml`：默认配置样例。
 - `.github/workflows/ci.yml`：GitHub Actions lint/test，不包含镜像构建 job。
@@ -4837,17 +4839,40 @@ git commit -m "feat: 实现 fallback 四层降级引擎"
 
 ---
 
-## 任务 16：实现认证、限流和日志中间件
+## 任务 16：实现接入层中间件（RequestID、认证、限流、参数校验、日志）
+
+**中间件链顺序（与设计文档一致）：**
+
+```
+Request → RequestID注入 → 请求日志 → API Key认证 → 滑动窗口限流 → 参数校验 → Handler
+```
+
+**依赖说明：**
+- 限流中间件依赖 Redis 客户端（`github.com/redis/go-redis/v9`），测试使用 `miniredis`
+- 日志中间件依赖 `internal/observability`（Logger、RequestID）
+- 参数校验中间件需访问全量模型列表（从所有 Provider 配置汇总）
 
 **文件：**
+- 新建： `internal/ingress/middleware_requestid.go`
+- 新建： `internal/ingress/middleware_requestid_test.go`
 - 新建： `internal/ingress/middleware_auth.go`
-- 新建： `internal/ingress/middleware_ratelimit.go`
-- 新建： `internal/ingress/middleware_logging.go`
 - 新建： `internal/ingress/middleware_auth_test.go`
+- 新建： `internal/ingress/middleware_ratelimit.go`
+- 新建： `internal/ingress/middleware_ratelimit_test.go`
+- 新建： `internal/ingress/middleware_validation.go`
+- 新建： `internal/ingress/middleware_validation_test.go`
+- 新建： `internal/ingress/middleware_logging.go`
+- 新建： `internal/ingress/middleware_logging_test.go`
 
-- [ ] **步骤 1：先写认证测试**
+---
 
-文件： `internal/ingress/middleware_auth_test.go`
+### 阶段 A：RequestID 中间件
+
+作为中间件链的第一个中间件，为每个请求生成 UUID 作为 request_id，注入 Gin context 和响应头 `X-Request-ID`。
+
+- [ ] **步骤 A1：先写 RequestID 测试**
+
+文件： `internal/ingress/middleware_requestid_test.go`
 
 ```go
 package ingress
@@ -4859,66 +4884,147 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
-	"github.com/viif/momu-llmgateway/internal/config"
 )
 
-func TestAuthMiddlewareAcceptsBearerKey(t *testing.T) {
+func TestRequestIDMiddlewareGeneratesAndSetsHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.Use(AuthMiddleware([]config.APIKeyConfig{{Key: "sk-test", Name: "test", AllowedModels: []string{"*"}}}))
-	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	r.Use(RequestIDMiddleware())
+	r.GET("/ok", func(c *gin.Context) {
+		id, exists := c.Get("request_id")
+		require.True(t, exists)
+		require.NotEmpty(t, id)
+		c.Status(http.StatusNoContent)
+	})
 	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
-	req.Header.Set("Authorization", "Bearer sk-test")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusNoContent, w.Code)
+	require.NotEmpty(t, w.Header().Get("X-Request-ID"))
+}
+
+func TestRequestIDMiddlewareMultipleRequestsUnique(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	ids := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+		id := w.Header().Get("X-Request-ID")
+		require.NotEmpty(t, id)
+		require.False(t, ids[id], "duplicate request id")
+		ids[id] = true
+	}
 }
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [ ] **步骤 A2：运行测试确认失败**
 
 ```bash
-go test ./internal/ingress -run TestAuthMiddlewareAcceptsBearerKey -v
+go test ./internal/ingress -run 'TestRequestIDMiddleware' -v
 ```
 
-预期：失败，提示 `AuthMiddleware` 未定义。
+预期：失败，提示 `RequestIDMiddleware` 未定义。
 
-- [ ] **步骤 3：实现中间件**
+- [ ] **步骤 A3：实现 RequestID 中间件**
 
-文件： `internal/ingress/middleware_auth.go`
+文件： `internal/ingress/middleware_requestid.go`
+
+```go
+package ingress
+
+import (
+	"github.com/gin-gonic/gin"
+	"github.com/viif/momu-llmgateway/internal/observability"
+)
+
+func RequestIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := observability.NewRequestID()
+		c.Set("request_id", id)
+		c.Header("X-Request-ID", id)
+		c.Next()
+	}
+}
+```
+
+- [ ] **步骤 A4：验证测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestRequestIDMiddleware' -v
+```
+
+预期：全部 PASS。
+
+- [ ] **步骤 A5：提交**
+
+```bash
+git add internal/ingress/middleware_requestid.go internal/ingress/middleware_requestid_test.go
+git commit -m "feat: 添加 requestid 注入中间件"
+```
+
+---
+
+### 阶段 B：日志中间件
+
+记录每个请求的结构化日志，包含 `request_id`（从 context 取）、`method`、`path`、`status`、`latency`、`content_length`。错误响应时使用 `Warn` 级别。
+
+- [ ] **步骤 B1：先写日志中间件测试**
+
+文件： `internal/ingress/middleware_logging_test.go`
 
 ```go
 package ingress
 
 import (
 	"net/http"
-	"strings"
+	"net/http/httptest"
+	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/stretchr/testify/require"
 )
 
-func AuthMiddleware(keys []config.APIKeyConfig) gin.HandlerFunc {
-	allowed := map[string]config.APIKeyConfig{}
-	for _, k := range keys { allowed[k.Key] = k }
-	return func(c *gin.Context) {
-		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
-		if _, ok := allowed[token]; !ok || token == "" { c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"}); return }
-		c.Set("api_key", token)
-		c.Next()
-	}
+func TestLoggingMiddlewareWritesStructuredLog(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.Use(LoggingMiddleware())
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	// 验证 request_id 已注入（由 RequestIDMiddleware 负责）
+	require.NotEmpty(t, w.Header().Get("X-Request-ID"))
+}
+
+func TestLoggingMiddlewareDoesNotBlockOnError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.Use(LoggingMiddleware())
+	r.GET("/err", func(c *gin.Context) { c.AbortWithStatus(http.StatusInternalServerError) })
+
+	req := httptest.NewRequest(http.MethodGet, "/err", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
 }
 ```
 
-文件： `internal/ingress/middleware_ratelimit.go`
+- [ ] **步骤 B2：运行测试确认失败**
 
-```go
-package ingress
-
-import "github.com/gin-gonic/gin"
-
-func RateLimitMiddleware() gin.HandlerFunc { return func(c *gin.Context) { c.Next() } }
+```bash
+go test ./internal/ingress -run 'TestLoggingMiddleware' -v
 ```
+
+预期：失败，提示 `LoggingMiddleware` 未定义。
+
+- [ ] **步骤 B3：实现日志中间件**
 
 文件： `internal/ingress/middleware_logging.go`
 
@@ -4935,25 +5041,864 @@ import (
 
 func LoggingMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now(); c.Next()
-		observability.Logger.Info("request", zap.String("path", c.Request.URL.Path), zap.Int("status", c.Writer.Status()), zap.Duration("latency", time.Since(start)))
+		start := time.Now()
+		c.Next()
+		latency := time.Since(start)
+		status := c.Writer.Status()
+		fields := []zap.Field{
+			zap.String("method", c.Request.Method),
+			zap.String("path", c.Request.URL.Path),
+			zap.Int("status", status),
+			zap.Duration("latency", latency),
+			zap.Int64("content_length", c.Request.ContentLength),
+		}
+		if rid, exists := c.Get("request_id"); exists {
+			fields = append(fields, zap.String("request_id", rid.(string)))
+		}
+		if status >= 400 {
+			observability.Logger.Warn("request", fields...)
+		} else {
+			observability.Logger.Info("request", fields...)
+		}
 	}
 }
 ```
 
-- [ ] **步骤 4：验证测试通过**
+- [ ] **步骤 B4：验证测试通过**
 
 ```bash
-go test ./internal/ingress -run TestAuthMiddlewareAcceptsBearerKey -v
+go test ./internal/ingress -run 'TestLoggingMiddleware' -v
 ```
 
-预期：PASS。
+预期：全部 PASS。
 
-- [ ] **步骤 5：提交**
+- [ ] **步骤 B5：提交**
 
 ```bash
-git add internal/ingress/middleware_*.go internal/ingress/middleware_auth_test.go
-git commit -m "feat: 添加接入层中间件"
+git add internal/ingress/middleware_logging.go internal/ingress/middleware_logging_test.go
+git commit -m "feat: 添加结构化请求日志中间件"
+```
+
+---
+
+### 阶段 C：认证中间件
+
+校验 `Authorization: Bearer <key>` 请求头。认证成功后，将 `api_key`、`api_key_name`、`api_key_rate_limit` 注入 context，供限流中间件和下游使用。认证失败返回 401。
+
+在认证通过后，还需校验 `allowed_models`：如果请求体中的 `model` 字段不在该 key 的允许列表中（且列表不为 `["*"]`），拒绝请求并返回 403。
+
+- [ ] **步骤 C1：先写认证中间件测试**
+
+文件： `internal/ingress/middleware_auth_test.go`
+
+```go
+package ingress
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/config"
+)
+
+func TestAuthMiddlewareAcceptsBearerKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-test", Name: "test", RateLimit: 60, AllowedModels: []string{"*"}},
+	}))
+	r.POST("/v1/chat/completions", func(c *gin.Context) {
+		name, _ := c.Get("api_key_name")
+		require.Equal(t, "test", name)
+		rl, _ := c.Get("api_key_rate_limit")
+		require.Equal(t, 60, rl)
+		c.Status(http.StatusOK)
+	})
+	body, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestAuthMiddlewareRejectsMissingAuthorization(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{{Key: "sk-test", Name: "test", AllowedModels: []string{"*"}}}))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestAuthMiddlewareRejectsInvalidKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{{Key: "sk-test", Name: "test", AllowedModels: []string{"*"}}}))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer sk-wrong")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestAuthMiddlewareRejectsNonBearerPrefix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{{Key: "sk-test", Name: "test", AllowedModels: []string{"*"}}}))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Basic sk-test")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestAuthMiddlewareAllowedModelsEnforced(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-limited", Name: "limited", AllowedModels: []string{"gpt-4o-mini"}},
+	}))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+	body, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-limited")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.Contains(t, w.Body.String(), "model_not_allowed")
+}
+
+func TestAuthMiddlewareWildcardAllowsAnyModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-admin", Name: "admin", AllowedModels: []string{"*"}},
+	}))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+	body, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-admin")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+```
+
+- [ ] **步骤 C2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestAuthMiddleware' -v
+```
+
+预期：失败，提示 `AuthMiddleware` 未定义。
+
+- [ ] **步骤 C3：实现认证中间件**
+
+文件： `internal/ingress/middleware_auth.go`
+
+```go
+package ingress
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/viif/momu-llmgateway/internal/config"
+)
+
+func AuthMiddleware(keys []config.APIKeyConfig) gin.HandlerFunc {
+	allowed := map[string]config.APIKeyConfig{}
+	for _, k := range keys {
+		allowed[k.Key] = k
+	}
+	return func(c *gin.Context) {
+		token := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		cfg, ok := allowed[token]
+		if !ok || token == "" || token == c.GetHeader("Authorization") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid api key"})
+			return
+		}
+		c.Set("api_key", token)
+		c.Set("api_key_name", cfg.Name)
+		c.Set("api_key_rate_limit", cfg.RateLimit)
+
+		if !modelAllowed(cfg.AllowedModels, c) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "model_not_allowed",
+				"message": "requested model is not in the allowed models for this API key",
+			})
+			return
+		}
+
+		c.Next()
+	}
+}
+
+func modelAllowed(allowedModels []string, c *gin.Context) bool {
+	if len(allowedModels) == 1 && allowedModels[0] == "*" {
+		return true
+	}
+	modelName := extractModelFromBody(c)
+	if modelName == "" {
+		return true
+	}
+	for _, m := range allowedModels {
+		if m == modelName {
+			return true
+		}
+	}
+	return false
+}
+
+func extractModelFromBody(c *gin.Context) string {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return ""
+	}
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+	var parsed struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Model
+}
+```
+
+- [ ] **步骤 C4：验证测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestAuthMiddleware' -v
+```
+
+预期：全部 PASS（6 个测试）。
+
+- [ ] **步骤 C5：提交**
+
+```bash
+git add internal/ingress/middleware_auth.go internal/ingress/middleware_auth_test.go
+git commit -m "feat: 添加 api key 认证和模型白名单中间件"
+```
+
+---
+
+### 阶段 D：限流中间件
+
+基于 Redis 实现滑动窗口限流。每个 API Key 独立计数，窗口大小固定为 1 分钟，限额从配置的 `api_keys[].rate_limit` 读取。
+
+算法：使用 Redis `ZSET`，key 格式为 `ratelimit:{api_key}`。每次请求：
+1. 清理过期成员：`ZREMRANGEBYSCORE key 0 (now - 60s)`
+2. 计数当前窗口内成员：`ZCARD key`
+3. 超过限额 → 返回 429 Rate Limit Exceeded
+4. 未超限额 → `ZADD key now random_string`，放行
+
+Redis 不可用时优雅降级，放行请求（不阻塞业务）。
+
+- [ ] **步骤 D1：先写限流中间件测试**
+
+文件： `internal/ingress/middleware_ratelimit_test.go`
+
+```go
+package ingress
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
+)
+
+func setupRateLimitRouter(client *redis.Client) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("api_key", "sk-test")
+		c.Set("api_key_rate_limit", 3)
+		c.Next()
+	})
+	r.Use(RateLimitMiddleware(client))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+	return r
+}
+
+func TestRateLimitAllowsUnderLimit(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := setupRateLimitRouter(client)
+
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+		require.Equal(t, http.StatusOK, w.Code, "request %d should pass", i+1)
+	}
+}
+
+func TestRateLimitBlocksOverLimit(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := setupRateLimitRouter(client)
+
+	for i := 0; i < 5; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+		if i < 3 {
+			require.Equal(t, http.StatusOK, w.Code, "request %d should pass", i+1)
+		} else {
+			require.Equal(t, http.StatusTooManyRequests, w.Code, "request %d should be blocked", i+1)
+		}
+	}
+}
+
+func TestRateLimitResetsAfterWindow(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	r := setupRateLimitRouter(client)
+
+	for i := 0; i < 3; i++ {
+		r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/ok", nil))
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+
+	mr.FastForward(61 * time.Second)
+
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestRateLimitPerKeyIsolation(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		key := c.Request.Header.Get("X-Api-Key")
+		c.Set("api_key", key)
+		c.Set("api_key_rate_limit", 1)
+		c.Next()
+	})
+	r.Use(RateLimitMiddleware(client))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	reqA := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	reqA.Header.Set("X-Api-Key", "key-a")
+	reqB := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	reqB.Header.Set("X-Api-Key", "key-b")
+
+	require.Equal(t, http.StatusOK, httptest.NewRecorder().Result().StatusCode)
+	r.ServeHTTP(httptest.NewRecorder(), reqA)
+	require.Equal(t, http.StatusOK, httptest.NewRecorder().Result().StatusCode)
+
+	r.ServeHTTP(httptest.NewRecorder(), reqB)
+	// key-b should still be under its own limit
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, reqB)
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "key-b should exhaust its own limit")
+}
+
+func TestRateLimitMissingKeySkipsCheck(t *testing.T) {
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(RateLimitMiddleware(client))
+	r.GET("/ok", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ok", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+}
+```
+
+- [ ] **步骤 D2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestRateLimit' -v
+```
+
+预期：失败，提示 `RateLimitMiddleware` 未定义或签名不匹配（需要 `*redis.Client` 参数）。
+
+- [ ] **步骤 D3：实现限流中间件**
+
+文件： `internal/ingress/middleware_ratelimit.go`
+
+```go
+package ingress
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+)
+
+func RateLimitMiddleware(client *redis.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		keyRaw, exists := c.Get("api_key")
+		if !exists || client == nil {
+			c.Next()
+			return
+		}
+		key := keyRaw.(string)
+		limitRaw, exists := c.Get("api_key_rate_limit")
+		if !exists {
+			c.Next()
+			return
+		}
+		limit := limitRaw.(int)
+		if limit <= 0 {
+			c.Next()
+			return
+		}
+
+		ctx := c.Request.Context()
+		rateKey := fmt.Sprintf("ratelimit:%s", key)
+		now := time.Now().UnixMilli()
+		windowStart := now - 60_000
+
+		pipe := client.Pipeline()
+		pipe.ZRemRangeByScore(ctx, rateKey, "0", fmt.Sprintf("%d", windowStart))
+		cardCmd := pipe.ZCard(ctx, rateKey)
+		if _, err := pipe.Exec(ctx); err != nil {
+			c.Next()
+			return
+		}
+
+		count, err := cardCmd.Val()
+		if err != nil {
+			c.Next()
+			return
+		}
+		if int(count) >= limit {
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "rate_limit_exceeded",
+				"message": fmt.Sprintf("rate limit exceeded: %d requests per minute", limit),
+			})
+			return
+		}
+
+		member := randomID(8)
+		client.ZAdd(ctx, rateKey, redis.Z{Score: float64(now), Member: member})
+		client.Expire(ctx, rateKey, 120*time.Second)
+
+		c.Next()
+	}
+}
+
+func randomID(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+```
+
+- [ ] **步骤 D4：验证测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestRateLimit' -v
+```
+
+预期：全部 PASS（5 个测试）。
+
+- [ ] **步骤 D5：提交**
+
+```bash
+git add internal/ingress/middleware_ratelimit.go internal/ingress/middleware_ratelimit_test.go
+git commit -m "feat: 添加 redis 滑动窗口限流中间件"
+```
+
+---
+
+### 阶段 E：参数校验中间件
+
+校验 `POST /v1/chat/completions` 请求体中的关键字段：
+- `model` 非空且存在于所有 Provider 的模型列表中
+- `messages` 非空数组
+- `temperature`（如提供）∈ [0, 2]
+- `max_tokens`（如提供）为正整数
+
+校验失败返回 400 Bad Request，附带具体错误描述。
+
+- [ ] **步骤 E1：先写参数校验测试**
+
+文件： `internal/ingress/middleware_validation_test.go`
+
+```go
+package ingress
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+var testModels = []string{"gpt-4o", "gpt-4o-mini", "deepseek-chat"}
+
+func TestValidationAcceptsValidRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{
+		"model": "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestValidationRejectsEmptyModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{"messages": []map[string]string{{"role": "user", "content": "hi"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "model")
+}
+
+func TestValidationRejectsUnknownModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "unknown-model",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "unknown model")
+}
+
+func TestValidationRejectsEmptyMessages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{"model": "gpt-4o", "messages": []map[string]string{}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "messages")
+}
+
+func TestValidationRejectsTemperatureOutOfRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{
+		"model":       "gpt-4o",
+		"messages":    []map[string]string{{"role": "user", "content": "hi"}},
+		"temperature": 2.5,
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "temperature")
+}
+
+func TestValidationRejectsNegativeMaxTokens(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"max_tokens": -1,
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "max_tokens")
+}
+
+func TestValidationSkipsNonChatPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+}
+```
+
+- [ ] **步骤 E2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestValidation' -v
+```
+
+预期：失败，提示 `ValidationMiddleware` 未定义。
+
+- [ ] **步骤 E3：实现参数校验中间件**
+
+文件： `internal/ingress/middleware_validation.go`
+
+```go
+package ingress
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+type chatRequest struct {
+	Model       string  `json:"model"`
+	Messages    []any   `json:"messages"`
+	Temperature *float64 `json:"temperature"`
+	MaxTokens   *int    `json:"max_tokens"`
+}
+
+func ValidationMiddleware(allowedModels []string) gin.HandlerFunc {
+	modelSet := make(map[string]bool, len(allowedModels))
+	for _, m := range allowedModels {
+		modelSet[m] = true
+	}
+	return func(c *gin.Context) {
+		if !strings.HasPrefix(c.Request.URL.Path, "/v1/chat/completions") || c.Request.Method != http.MethodPost {
+			c.Next()
+			return
+		}
+
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+			return
+		}
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+
+		var req chatRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+			return
+		}
+
+		if req.Model == "" {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
+			return
+		}
+		if !modelSet[req.Model] {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "unknown model: " + req.Model})
+			return
+		}
+		if len(req.Messages) == 0 {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "messages must not be empty"})
+			return
+		}
+		if req.Temperature != nil && (*req.Temperature < 0 || *req.Temperature > 2) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "temperature must be in range [0, 2]"})
+			return
+		}
+		if req.MaxTokens != nil && *req.MaxTokens <= 0 {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "max_tokens must be a positive integer"})
+			return
+		}
+
+		c.Next()
+	}
+}
+```
+
+- [ ] **步骤 E4：验证测试通过**
+
+```bash
+go test ./internal/ingress -run 'TestValidation' -v
+```
+
+预期：全部 PASS（7 个测试）。
+
+- [ ] **步骤 E5：提交**
+
+```bash
+git add internal/ingress/middleware_validation.go internal/ingress/middleware_validation_test.go
+git commit -m "feat: 添加请求参数校验中间件"
+```
+
+---
+
+### 阶段 F：中间件链集成测试
+
+验证完整中间件链的组装顺序和交互正确性。
+
+- [ ] **步骤 F1：先写集成测试**
+
+文件： `internal/ingress/middleware_chain_test.go`
+
+```go
+package ingress
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
+	"github.com/viif/momu-llmgateway/internal/config"
+)
+
+func TestMiddlewareChainFullFlow(t *testing.T) {
+	mr := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.Use(LoggingMiddleware())
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-test", Name: "test", RateLimit: 100, AllowedModels: []string{"*"}},
+	}))
+	r.Use(RateLimitMiddleware(redisClient))
+	r.Use(ValidationMiddleware([]string{"gpt-4o", "gpt-4o-mini", "deepseek-chat"}))
+	r.POST("/v1/chat/completions", func(c *gin.Context) {
+		requestID, _ := c.Get("request_id")
+		require.NotEmpty(t, requestID)
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-test")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotEmpty(t, w.Header().Get("X-Request-ID"))
+}
+
+func TestMiddlewareChainAuthFailsBeforeValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mr := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.Use(LoggingMiddleware())
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-test", Name: "test", RateLimit: 100, AllowedModels: []string{"gpt-4o"}},
+	}))
+	r.Use(RateLimitMiddleware(redisClient))
+	r.Use(ValidationMiddleware([]string{"gpt-4o", "deepseek-chat"}))
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// No Authorization header → should get 401, not 400
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestMiddlewareChainHealthBypassesAll(t *testing.T) {
+	mr := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	r.Use(RequestIDMiddleware())
+	r.Use(LoggingMiddleware())
+	r.Use(AuthMiddleware([]config.APIKeyConfig{
+		{Key: "sk-test", Name: "test", RateLimit: 100, AllowedModels: []string{"*"}},
+	}))
+	r.Use(RateLimitMiddleware(redisClient))
+	r.Use(ValidationMiddleware([]string{"gpt-4o"}))
+	r.GET("/health", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.NotEmpty(t, w.Header().Get("X-Request-ID"))
+}
+```
+
+- [ ] **步骤 F2：运行测试确认失败**
+
+```bash
+go test ./internal/ingress -run 'TestMiddlewareChain' -v
+```
+
+预期：多个中间件未定义或签名不符。
+
+- [ ] **步骤 F3：验证全部测试通过**
+
+```bash
+go test ./internal/ingress -v
+```
+
+预期：全部 PASS（23 个测试：2 RequestID + 2 Logging + 6 Auth + 5 RateLimit + 7 Validation + 3 Chain）。
+
+- [ ] **步骤 F4：提交**
+
+```bash
+git add internal/ingress/middleware_chain_test.go
+git commit -m "test: 添加中间件链集成测试"
 ```
 
 ---
@@ -5063,6 +6008,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"github.com/viif/momu-llmgateway/internal/config"
 	"github.com/viif/momu-llmgateway/internal/ingress"
@@ -5077,8 +6023,22 @@ func main() {
 	if err != nil { observability.Logger.Fatal("load config", zap.Error(err)) }
 	_ = config.WatchAndReload(cfgPath, func(*config.Config) { observability.Logger.Info("config reloaded") })
 
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		observability.Logger.Fatal("redis connect", zap.Error(err))
+	}
+
+	allModels := collectAllModels(cfg.Providers)
+
 	r := gin.New()
-	r.Use(gin.Recovery(), ingress.LoggingMiddleware(), ingress.AuthMiddleware(cfg.Auth.APIKeys), ingress.RateLimitMiddleware())
+	r.Use(
+		gin.Recovery(),
+		ingress.RequestIDMiddleware(),
+		ingress.LoggingMiddleware(),
+		ingress.AuthMiddleware(cfg.Auth.APIKeys),
+		ingress.RateLimitMiddleware(redisClient),
+		ingress.ValidationMiddleware(allModels),
+	)
 	ingress.RegisterRoutes(r, nil)
 
 	srv := &http.Server{Addr: fmt.Sprintf(":%d", cfg.Server.Port), Handler: r, ReadTimeout: cfg.Server.ReadTimeout, WriteTimeout: cfg.Server.WriteTimeout}
@@ -5090,6 +6050,20 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+func collectAllModels(providers map[string]config.ProviderConfig) []string {
+	seen := map[string]bool{}
+	var models []string
+	for _, p := range providers {
+		for _, m := range p.Models {
+			if !seen[m] {
+				seen[m] = true
+				models = append(models, m)
+			}
+		}
+	}
+	return models
 }
 ```
 
@@ -5348,7 +6322,7 @@ git commit -m "fix: 完成网关端到端验证"
 
 ## 自检结果
 
-- Spec 覆盖：配置热加载、环境变量展开、OpenAI/Anthropic/DeepSeek/Qwen/GLM Provider、路由策略、熔断、负载均衡、语义缓存、Fallback、认证、限流、日志、Prometheus、Dockerfile、GitHub Actions CI、手动验证均有对应任务。
+- Spec 覆盖：配置热加载、环境变量展开、OpenAI/Anthropic/DeepSeek/Qwen/GLM Provider、路由策略、熔断、负载均衡、语义缓存、Fallback、RequestID 注入、API Key 认证、滑动窗口限流、参数校验、结构化日志、Prometheus、Dockerfile、GitHub Actions CI、手动验证均有对应任务。
 - CI 对齐：`.github/workflows/ci.yml` 只包含 `lint` 和 `test` job；不包含镜像构建 job。
 - 占位符检查：未发现占位式待补内容。
 - 类型一致性：核心类型从任务 3 定义，后续任务统一引用 `model.StandardRequest`、`model.StandardResponse`、`model.Provider`、`model.StreamChunk`。

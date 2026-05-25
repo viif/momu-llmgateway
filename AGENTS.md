@@ -24,7 +24,7 @@
 - [x] 任务 13：实现路由策略链 — `internal/decision/router.go`、`strategy_semantic.go`、`strategy_capability.go`、`strategy_cost.go`
 - [x] 任务 14：实现语义缓存 — `internal/cache/semantic.go`、`redis_store.go`
 - [x] 任务 15：实现 Fallback 引擎 — `internal/fallback/engine.go`、`engine_test.go`
-- [ ] 任务 16-21：待依次执行
+- [x] 任务 16：实现接入层中间件（RequestID、认证、限流、参数校验、日志）
 
 ### 实现约束
 
