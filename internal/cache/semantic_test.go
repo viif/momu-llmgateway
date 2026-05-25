@@ -187,14 +187,14 @@ func TestStoreEvictsOldestWhenFull(t *testing.T) {
 	}}
 	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 2, SimilarityThreshold: 0.8, TTL: time.Hour}, embedder, nil)
 
-	c.Store(context.Background(), &model.StandardRequest{
+	require.NoError(t, c.Store(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "a"}},
-	}, &model.StandardResponse{ID: "a"})
+	}, &model.StandardResponse{ID: "a"}))
 	time.Sleep(time.Millisecond)
 
-	c.Store(context.Background(), &model.StandardRequest{
+	require.NoError(t, c.Store(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "b"}},
-	}, &model.StandardResponse{ID: "b"})
+	}, &model.StandardResponse{ID: "b"}))
 
 	resp, ok := c.Lookup(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "a"}},
@@ -202,9 +202,9 @@ func TestStoreEvictsOldestWhenFull(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "a", resp.ID)
 
-	c.Store(context.Background(), &model.StandardRequest{
+	require.NoError(t, c.Store(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "c"}},
-	}, &model.StandardResponse{ID: "c"})
+	}, &model.StandardResponse{ID: "c"}))
 
 	_, ok = c.Lookup(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "b"}},

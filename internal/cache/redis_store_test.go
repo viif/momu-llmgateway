@@ -19,7 +19,7 @@ func newTestRedis(t *testing.T) (*RedisStore, *miniredis.Miniredis) {
 
 func TestRedisStoreSaveAndLoad(t *testing.T) {
 	store, _ := newTestRedis(t)
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	v := []float64{0.1, 0.2, 0.3}
 	resp := []byte(`{"id":"test"}`)
@@ -36,7 +36,7 @@ func TestRedisStoreSaveAndLoad(t *testing.T) {
 
 func TestRedisStoreLoadAllEmpty(t *testing.T) {
 	store, _ := newTestRedis(t)
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	entries, err := store.LoadAll(context.Background(), "nonexistent")
 	require.NoError(t, err)
 	require.Empty(t, entries)
@@ -44,9 +44,9 @@ func TestRedisStoreLoadAllEmpty(t *testing.T) {
 
 func TestRedisStoreTTLExpiry(t *testing.T) {
 	store, mr := newTestRedis(t)
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
-	store.Save(context.Background(), "gpt-4o", "key1", []float64{1}, []byte("v"), 100*time.Millisecond)
+	require.NoError(t, store.Save(context.Background(), "gpt-4o", "key1", []float64{1}, []byte("v"), 100*time.Millisecond))
 	mr.FastForward(200 * time.Millisecond)
 
 	entries, err := store.LoadAll(context.Background(), "gpt-4o")
@@ -56,10 +56,10 @@ func TestRedisStoreTTLExpiry(t *testing.T) {
 
 func TestRedisStoreMultipleEntries(t *testing.T) {
 	store, _ := newTestRedis(t)
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
-	store.Save(context.Background(), "gpt-4o", "k1", []float64{1}, []byte("a"), time.Hour)
-	store.Save(context.Background(), "gpt-4o", "k2", []float64{2}, []byte("b"), time.Hour)
+	require.NoError(t, store.Save(context.Background(), "gpt-4o", "k1", []float64{1}, []byte("a"), time.Hour))
+	require.NoError(t, store.Save(context.Background(), "gpt-4o", "k2", []float64{2}, []byte("b"), time.Hour))
 
 	entries, err := store.LoadAll(context.Background(), "gpt-4o")
 	require.NoError(t, err)
