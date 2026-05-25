@@ -66,7 +66,7 @@ func TestOpenAICompatibleSendSuccess(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(model.StandardResponse{
+		_ = json.NewEncoder(w).Encode(model.StandardResponse{
 			ID:      "chatcmpl-1",
 			Model:   "gpt-4o",
 			Choices: []model.Choice{{Index: 0, Message: model.Message{Role: "assistant", Content: "Hello"}, FinishReason: "stop"}},
@@ -89,7 +89,7 @@ func TestOpenAICompatibleSendSuccess(t *testing.T) {
 func TestOpenAICompatibleSendHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error"}}`))
 	}))
 	defer srv.Close()
 

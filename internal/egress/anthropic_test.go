@@ -77,7 +77,7 @@ func TestAnthropicSendSuccess(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]any{
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":    "msg_1",
 			"model": "claude-sonnet-4-20250514",
 			"content": []map[string]string{
@@ -113,7 +113,7 @@ func TestAnthropicSendSuccess(t *testing.T) {
 func TestAnthropicSendHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
-		w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`))
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`))
 	}))
 	defer srv.Close()
 
@@ -140,7 +140,7 @@ func TestAnthropicSendStreamSuccess(t *testing.T) {
 			{"event: message_stop", `data: {"type":"message_stop"}`},
 		}
 		for _, pair := range events {
-			w.Write([]byte(pair[0] + "\n" + pair[1] + "\n\n"))
+			_, _ = w.Write([]byte(pair[0] + "\n" + pair[1] + "\n\n"))
 			flusher.Flush()
 		}
 	}))
