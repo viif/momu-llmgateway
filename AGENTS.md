@@ -22,7 +22,8 @@
 - [x] 任务 11：实现加权负载均衡 — `internal/decision/balancer.go`、`balancer_test.go`
 - [x] 任务 12：实现本地嵌入引擎 — `internal/embedding/embedding.go`、`engine.go`、`onnx.go`
 - [x] 任务 13：实现路由策略链 — `internal/decision/router.go`、`strategy_semantic.go`、`strategy_capability.go`、`strategy_cost.go`
-- [ ] 任务 14-21：待依次执行
+- [x] 任务 14：实现语义缓存 — `internal/cache/semantic.go`、`redis_store.go`
+- [ ] 任务 15-21：待依次执行
 
 ### 实现约束
 
