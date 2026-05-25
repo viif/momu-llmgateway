@@ -278,11 +278,17 @@ func TestCacheConcurrentAccess(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); c.Lookup(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}) }()
+		go func() {
+			defer wg.Done()
+			c.Lookup(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}})
+		}()
 	}
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); c.Store(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}, &model.StandardResponse{ID: "concurrent"}) }()
+		go func() {
+			defer wg.Done()
+			c.Store(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}, &model.StandardResponse{ID: "concurrent"})
+		}()
 	}
 	wg.Wait()
 }

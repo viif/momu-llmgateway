@@ -35,14 +35,14 @@ type CacheEntry struct {
 }
 
 type SemanticCache struct {
-	mu               sync.RWMutex
-	entries          map[string][]CacheEntry
-	maxEntries       int
-	threshold        float64
-	ttl              time.Duration
-	enabled          bool
-	embedder         Embedder
-	store            CacheStore
+	mu                sync.RWMutex
+	entries           map[string][]CacheEntry
+	maxEntries        int
+	threshold         float64
+	ttl               time.Duration
+	enabled           bool
+	embedder          Embedder
+	store             CacheStore
 	recoverableModels []string
 }
 
