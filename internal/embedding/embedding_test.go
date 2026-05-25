@@ -37,3 +37,43 @@ func TestMeanPooling(t *testing.T) {
 	require.InDelta(t, 3.5, result[0][1], 0.001)
 	require.InDelta(t, 4.5, result[0][2], 0.001)
 }
+
+func TestCosineSimilarityDifferentLengths(t *testing.T) {
+	require.InDelta(t, 0.0, CosineSimilarity([]float64{1, 0}, []float64{1, 0, 0}), 0.0001)
+}
+
+func TestCosineSimilarityZeroVector(t *testing.T) {
+	require.InDelta(t, 0.0, CosineSimilarity([]float64{0, 0}, []float64{0, 0}), 0.0001)
+}
+
+func TestCosineSimilarityNegativeValues(t *testing.T) {
+	require.InDelta(t, -1.0, CosineSimilarity([]float64{1, 0}, []float64{-1, 0}), 0.0001)
+}
+
+func TestMeanPoolingAllMasked(t *testing.T) {
+	lastHidden := [][][]float32{
+		{
+			{1.0, 2.0, 3.0},
+			{4.0, 5.0, 6.0},
+		},
+	}
+	mask := [][]int64{{0, 0}}
+	result := MeanPooling(lastHidden, mask)
+	require.Len(t, result, 1)
+	require.Len(t, result[0], 3)
+	require.InDelta(t, 0.0, result[0][0], 0.001)
+	require.InDelta(t, 0.0, result[0][1], 0.001)
+	require.InDelta(t, 0.0, result[0][2], 0.001)
+}
+
+func TestMeanPoolingEmptyInput(t *testing.T) {
+	result := MeanPooling(nil, nil)
+	require.Nil(t, result)
+	result = MeanPooling([][][]float32{}, [][]int64{})
+	require.Nil(t, result)
+}
+
+func TestNormalizeVectorEmpty(t *testing.T) {
+	v := NormalizeVector([]float64{})
+	require.Empty(t, v)
+}
