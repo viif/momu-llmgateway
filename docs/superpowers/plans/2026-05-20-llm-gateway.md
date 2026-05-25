@@ -7467,7 +7467,7 @@ git commit -m "feat: 添加 dockerfile 和 .dockerignore"
 
 ## 任务 20：完善 GitHub Actions CI（加入 lint、竞态检测、ONNX 支持）
 
-> 任务 2 已建立基础 CI（build + test），本任务在其基础上增加 lint 检查、竞态检测（`-race`）、ONNX Runtime 共享库安装和 `-tags onnx` 构建测试。
+> 任务 2 已建立基础 CI（build + test），本任务在其基础上增加 lint 检查、竞态检测（`-race`）、ONNX Runtime 共享库安装和 BGE 模型下载，使 CI 可运行全量测试（含嵌入引擎集成测试）。
 
 **文件：**
 - 修改： `.github/workflows/ci.yml`
@@ -7512,6 +7512,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+
       - name: Install ONNX Runtime
         run: |
           ONNX_VERSION="1.21.0"
@@ -7522,14 +7523,22 @@ jobs:
           sudo ldconfig
           echo "ONNXRUNTIME_LIB_PATH=/usr/local/lib/libonnxruntime.so.${ONNX_VERSION}" >> $GITHUB_ENV
 
-      - name: Build (with ONNX)
-        run: go build -tags onnx ./...
+      - name: Download BGE Model
+        run: |
+          MODEL_DIR="./.models/bge-small-zh-v1.5"
+          HF_BASE="https://huggingface.co/onnx-community/bge-small-zh-v1.5-ONNX/resolve/main"
+          mkdir -p "$MODEL_DIR"
+          curl -sL "$HF_BASE/onnx/model.onnx" -o "$MODEL_DIR/model.onnx"
+          curl -sL "$HF_BASE/onnx/model.onnx_data" -o "$MODEL_DIR/model.onnx_data"
+          curl -sL "$HF_BASE/tokenizer.json" -o "$MODEL_DIR/tokenizer.json"
+          curl -sL "$HF_BASE/tokenizer_config.json" -o "$MODEL_DIR/tokenizer_config.json"
+          echo "EMBEDDING_MODEL_PATH=$MODEL_DIR" >> $GITHUB_ENV
+
+      - name: Build
+        run: go build ./...
 
       - name: Run tests
         run: go test -race ./...
-
-      - name: Test ONNX embedding
-        run: go test -tags onnx -race -v ./internal/embedding/...
 ```
 
 - [ ] **步骤 2：验证 YAML 可解析**

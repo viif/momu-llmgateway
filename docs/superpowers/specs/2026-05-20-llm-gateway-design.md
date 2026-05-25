@@ -617,9 +617,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      - run: go test -race -coverprofile=coverage.out ./...
-      - name: Upload coverage
-        uses: codecov/codecov-action@v4
+      - run: go test -race ./...
 ```
 
 ## 10. 验证方案
