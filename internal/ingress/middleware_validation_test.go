@@ -133,7 +133,6 @@ func TestValidationAcceptsTemperatureBoundary(t *testing.T) {
 	}
 }
 
-
 func TestValidationRejectsMalformedBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
