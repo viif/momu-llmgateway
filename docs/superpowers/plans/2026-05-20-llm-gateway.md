@@ -6963,6 +6963,75 @@ git commit -m "feat: 实现聊天补全 handler 完整编排"
 **文件：**
 - 修改： `cmd/gateway/main.go`
 
+### 组装清单
+
+按依赖顺序初始化以下组件，最后注入 ChatService 并启动 HTTP 服务：
+
+```
+load config
+  → init zap logger
+  → init embedding engine (ONNX + tokenizer)
+  → init Redis client
+  → init provider registry (traverse cfg.Providers, create adapters, register)
+  → init balancer (register all provider names)
+  → init circuit breaker manager
+  → init semantic router (precompute category prototype vectors)
+  → init capability router
+  → init cost cascade router
+  → init semantic cache (embedder + optional RedisStore)
+  → init fallback engine
+  → init main router (with modelProviders / buildCandidates closures)
+  → NewChatService(router, cbManager, cache, fallback, providerLookup)
+  → RegisterRoutes(r, chatSvc)
+  → graceful shutdown (close redis, embedding engine, cache store)
+```
+
+### 关键类型转换
+
+| 来源 (config) | 目标 (其他包) | 转换方式 |
+|---------------|--------------|---------|
+| `config.SemanticCacheConfig` | `cache.SemanticCacheConfig` | 逐字段拷贝 |
+| `config.BalancerConfig` | `decision.BalancerConfig` | `WarmupDuration.Seconds()` → `float64`；`HealthWindowSize.Seconds()` → `float64` |
+| `config.FallbackConfig` | `fallback.NewEngine()` | `cfg.Fallback.Chains`, `cfg.Fallback.RetryMax`, `cfg.Fallback.RetryBackoff` |
+| `config.CircuitBreakerConfig` | `ingress.NewCircuitBreakerManager()` | `cfg.CircuitBreaker.FailureThreshold`, `cfg.CircuitBreaker.Cooldown` |
+| `config.SemanticRoutingConfig` | `decision.NewSemanticRouter()` | 直接传递 |
+| `config.RoutingConfig.Rules` | `decision.NewCapabilityRouter()` | 直接传递 |
+| `config.RoutingConfig.Cascade` | `decision.NewCostRouter()` | 直接传递 |
+
+### 闭包函数
+
+`ModelProvidersFunc` 和 `BuildCandidatesFunc` 是两个关键回调，桥接 Registry / Config / Balancer：
+
+```go
+modelProviders := func(modelName string) []model.Provider {
+    return registry.ProvidersForModel(modelName)
+}
+
+buildCandidates := func(providers []model.Provider, modelName string) []decision.ProviderCandidate {
+    candidates := make([]decision.ProviderCandidate, len(providers))
+    for i, p := range providers {
+        cfg, ok := cfg.Providers[p.Name()]
+        baseWeight := 100.0
+        if ok {
+            baseWeight = float64(cfg.Weight)
+        }
+        candidates[i] = decision.ProviderCandidate{
+            ProviderName:  p.Name(),
+            Model:         modelName,
+            BaseWeight:    baseWeight,
+            HealthScore:   1.0,
+            WarmupFactor:  1.0,
+        }
+    }
+    return candidates
+}
+```
+
+- `modelProviders` 通过 Registry 按模型名查找所有可用 Provider，返回 `[]model.Provider` 切片。
+- `buildCandidates` 将 Provider 列表转为 Balancer 候选，从配置提取静态权重；`HealthScore` 和 `WarmupFactor` 初始为 1.0（后续由健康检查和预热逻辑动态更新）。
+
+### 步骤
+
 - [ ] **步骤 1：替换 main.go**
 
 文件： `cmd/gateway/main.go`
@@ -6980,26 +7049,203 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+
+	"github.com/viif/momu-llmgateway/internal/cache"
 	"github.com/viif/momu-llmgateway/internal/config"
+	"github.com/viif/momu-llmgateway/internal/decision"
+	"github.com/viif/momu-llmgateway/internal/egress"
+	"github.com/viif/momu-llmgateway/internal/embedding"
+	"github.com/viif/momu-llmgateway/internal/fallback"
 	"github.com/viif/momu-llmgateway/internal/ingress"
+	"github.com/viif/momu-llmgateway/internal/model"
 	"github.com/viif/momu-llmgateway/internal/observability"
 )
 
 func main() {
-	if err := observability.InitLogger(false); err != nil { panic(err) }
-	cfgPath := os.Getenv("GATEWAY_CONFIG")
-	if cfgPath == "" { cfgPath = "configs/gateway.yaml" }
-	cfg, err := config.Load(cfgPath)
-	if err != nil { observability.Logger.Fatal("load config", zap.Error(err)) }
-	_ = config.WatchAndReload(cfgPath, func(*config.Config) { observability.Logger.Info("config reloaded") })
+	// ── 1. 日志 ──────────────────────────────────────────────
+	if err := observability.InitLogger(false); err != nil {
+		panic(err)
+	}
+	log := observability.Logger
 
-	redisClient := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr, Password: cfg.Redis.Password, DB: cfg.Redis.DB})
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
-		observability.Logger.Fatal("redis connect", zap.Error(err))
+	// ── 2. 配置 ──────────────────────────────────────────────
+	cfgPath := os.Getenv("GATEWAY_CONFIG")
+	if cfgPath == "" {
+		cfgPath = "configs/gateway.yaml"
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		log.Fatal("load config", zap.Error(err))
+	}
+	_ = config.WatchAndReload(cfgPath, func(*config.Config) {
+		log.Info("config reloaded")
+	})
+
+	// ── 3. 嵌入引擎 ──────────────────────────────────────────
+	if err := embedding.Init(cfg.Embedding.OnnxLibraryPath, cfg.Embedding.ModelPath); err != nil {
+		log.Warn("embedding engine init failed, semantic features disabled", zap.Error(err))
 	}
 
+	// ── 4. Redis ─────────────────────────────────────────────
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     cfg.Redis.Addr,
+		Password: cfg.Redis.Password,
+		DB:       cfg.Redis.DB,
+	})
+	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+		log.Fatal("redis connect", zap.Error(err))
+	}
+
+	// ── 5. Provider 注册表 ──────────────────────────────────
+	registry := egress.NewRegistry()
+	for name, pc := range cfg.Providers {
+		var p model.Provider
+		switch pc.Type {
+		case "anthropic":
+			p = egress.NewAnthropic(pc.BaseURL, pc.APIKey, pc.Models, pc.Timeout)
+		default:
+			p = egress.NewOpenAICompatible(name, pc.BaseURL, pc.APIKey, pc.Models, pc.Timeout)
+		}
+		registry.Register(p)
+		log.Info("provider registered", zap.String("name", name), zap.Strings("models", pc.Models))
+	}
+
+	// ── 6. 负载均衡器 ────────────────────────────────────────
+	balancerCfg := decision.BalancerConfig{
+		ConcurrencyPenaltyCoefficient: cfg.Balancer.ConcurrencyPenaltyCoefficient,
+		LatencyPenaltyCoefficient:     cfg.Balancer.LatencyPenaltyCoefficient,
+		WarmupEnabled:                 cfg.Balancer.WarmupEnabled,
+		WarmupDuration:                cfg.Balancer.WarmupDuration.Seconds(),
+		HealthWindowSize:              cfg.Balancer.HealthWindowSize.Seconds(),
+		HealthMinRequests:             cfg.Balancer.HealthMinRequests,
+	}
+	balancer := decision.NewBalancer(balancerCfg)
+	for name := range cfg.Providers {
+		balancer.Register(name)
+	}
+
+	// ── 7. 熔断器管理器 ──────────────────────────────────────
+	cbManager := ingress.NewCircuitBreakerManager(
+		cfg.CircuitBreaker.FailureThreshold,
+		cfg.CircuitBreaker.Cooldown,
+	)
+
+	// ── 8. 路由策略 ──────────────────────────────────────────
+	var (
+		semanticRouter  *decision.SemanticRouter
+		capabilityRouter = decision.NewCapabilityRouter(cfg.Routing.Rules)
+		costRouter       = decision.NewCostRouter(cfg.Routing.Cascade)
+	)
+
+	if emb := embedding.Instance(); emb != nil {
+		semanticRouter, err = decision.NewSemanticRouter(cfg.SemanticRouting, emb)
+		if err != nil {
+			log.Warn("semantic router init failed", zap.Error(err))
+		} else {
+			log.Info("semantic router initialized",
+				zap.Int("categories", len(cfg.SemanticRouting.Categories)))
+		}
+	}
+
+	// ── 9. 语义缓存 ──────────────────────────────────────────
+	var (
+		semanticCache *cache.SemanticCache
+		cacheStore    cache.CacheStore
+	)
+	if cfg.SemanticCache.Enabled {
+		if redisClient != nil {
+			cacheStore, err = cache.NewRedisStore(cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+			if err != nil {
+				log.Warn("cache redis store init failed, using memory-only", zap.Error(err))
+			}
+		}
+
+		cacheCfg := cache.SemanticCacheConfig{
+			Enabled:             cfg.SemanticCache.Enabled,
+			SimilarityThreshold: cfg.SemanticCache.SimilarityThreshold,
+			MaxEntries:          cfg.SemanticCache.MaxEntries,
+			TTL:                 cfg.SemanticCache.TTL,
+			MaxPromptLength:     cfg.SemanticCache.MaxPromptLength,
+		}
+		semanticCache = cache.New(cacheCfg, embedding.Instance(), cacheStore)
+
+		if cacheStore != nil {
+			allModels := collectAllModels(cfg.Providers)
+			semanticCache.SetModels(allModels)
+		}
+	}
+
+	// ── 10. Fallback 引擎 ────────────────────────────────────
+	fallbackEng := fallback.NewEngine(
+		cfg.Fallback.Chains,
+		cfg.Fallback.RetryMax,
+		cfg.Fallback.RetryBackoff,
+		"",
+	)
+
+	// ── 11. 主 Router ────────────────────────────────────────
+	modelProviders := func(modelName string) []model.Provider {
+		return registry.ProvidersForModel(modelName)
+	}
+
+	buildCandidates := func(providers []model.Provider, modelName string) []decision.ProviderCandidate {
+		candidates := make([]decision.ProviderCandidate, len(providers))
+		for i, p := range providers {
+			pc, ok := cfg.Providers[p.Name()]
+			baseWeight := 100.0
+			if ok {
+				baseWeight = float64(pc.Weight)
+			}
+			candidates[i] = decision.ProviderCandidate{
+				ProviderName:  p.Name(),
+				Model:         modelName,
+				BaseWeight:    baseWeight,
+				HealthScore:   1.0,
+				WarmupFactor:  1.0,
+			}
+		}
+		return candidates
+	}
+
+	router := decision.NewRouter(
+		decision.RouterConfig{
+			Strategies:     cfg.Routing.Strategies,
+			DefaultCascade: cfg.Routing.Cascade["default"],
+		},
+		balancer,
+		semanticRouter,
+		capabilityRouter,
+		costRouter,
+		modelProviders,
+		buildCandidates,
+	)
+
+	// ── 12. ChatService ──────────────────────────────────────
+	providerLookup := func(name string) model.Provider {
+		return registry.ProviderByName(name)
+	}
+
+	// 适配类型：*cache.SemanticCache → ingress.SemanticCache
+	var ingressCache ingress.SemanticCache
+	if semanticCache != nil {
+		ingressCache = semanticCache
+	}
+
+	chatSvc := ingress.NewChatService(
+		router,
+		cbManager,
+		ingressCache,
+		fallbackEng,
+		providerLookup,
+	)
+
+	// ── 13. Prometheus 指标 ──────────────────────────────────
+	observability.RegisterMetrics(prometheus.DefaultRegisterer)
+
+	// ── 14. HTTP 服务 ────────────────────────────────────────
 	allModels := collectAllModels(cfg.Providers)
 
 	r := gin.New()
@@ -7011,17 +7257,46 @@ func main() {
 		ingress.RateLimitMiddleware(redisClient),
 		ingress.ValidationMiddleware(allModels),
 	)
-	ingress.RegisterRoutes(r, nil)
+	ingress.RegisterRoutes(r, chatSvc)
 
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", cfg.Server.Port), Handler: r, ReadTimeout: cfg.Server.ReadTimeout, WriteTimeout: cfg.Server.WriteTimeout}
-	go func() { if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { observability.Logger.Fatal("server failed", zap.Error(err)) } }()
+	srv := &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
+		Handler:      r,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+	}
 
+	go func() {
+		log.Info("gateway starting", zap.Int("port", cfg.Server.Port))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal("server failed", zap.Error(err))
+		}
+	}()
+
+	// ── 15. 优雅关闭 ─────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	log.Info("shutting down...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("server shutdown error", zap.Error(err))
+	}
+
+	if redisClient != nil {
+		_ = redisClient.Close()
+	}
+	if emb := embedding.Instance(); emb != nil {
+		emb.Close()
+	}
+	if cacheStore != nil {
+		_ = cacheStore.Close()
+	}
+
+	log.Info("gateway stopped")
 }
 
 func collectAllModels(providers map[string]config.ProviderConfig) []string {
@@ -7038,6 +7313,10 @@ func collectAllModels(providers map[string]config.ProviderConfig) []string {
 	return models
 }
 ```
+
+> **说明：** 语义缓存 `RedisStore` 与限流中间件共用同一个 `redisClient`。`cache.NewRedisStore()` 内部会创建新的 Redis 连接，为保持连接池独立，此处由 `cache.NewRedisStore` 独立建连；限流中间件使用顶层的 `redisClient`。若需复用同一连接，可将 `cache.NewRedisStore` 改为接受 `*redis.Client` 参数的构造函数（后续优化项）。
+
+> **类型适配说明：** `*cache.SemanticCache` 隐式实现了 `ingress.SemanticCache` 接口（`Lookup` / `Store` 签名完全匹配），直接赋值给 `ingressCache` 即可。同样 `*fallback.Engine` 隐式实现了 `ingress.FallbackEngine` 接口。
 
 - [ ] **步骤 2：验证构建**
 
@@ -7059,7 +7338,7 @@ go test ./...
 
 ```bash
 git add cmd/gateway/main.go
-git commit -m "feat: 组装网关服务启动流程"
+git commit -m "feat: 组装网关服务完整启动流程"
 ```
 
 ---
@@ -7251,7 +7530,7 @@ curl -i -X POST http://localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-预期：当前若 ChatService 尚未接入真实 Provider，可返回 `501` 和 `chat service not wired`；认证中间件不应返回 `401`。
+预期：返回 200 或上游 Provider 错误（取决于是否配置了有效的 API Key）。认证中间件不应返回 `401`。若无有效 API Key，预期为 `502 Bad Gateway`。
 
 - [ ] **步骤 6：提交最终验证修正**
 

@@ -25,7 +25,8 @@
 - [x] 任务 14：实现语义缓存 — `internal/cache/semantic.go`、`redis_store.go`
 - [x] 任务 15：实现 Fallback 引擎 — `internal/fallback/engine.go`、`engine_test.go`
 - [x] 任务 16：实现接入层中间件（RequestID、认证、限流、参数校验、日志）
-- [ ] 任务 17：实现聊天补全 Handler 完整编排 — `internal/ingress/service.go`、`handler.go`、`service_test.go`、`handler_test.go`（路由决策→熔断检查→语义缓存→Fallback 降级→Provider 调用→SSE 流式→指标记录）
+- [x] 任务 17：实现聊天补全 Handler 完整编排 — `internal/ingress/service.go`、`handler.go`、`service_test.go`、`handler_test.go`（路由决策→熔断检查→语义缓存→Fallback 降级→Provider 调用→SSE 流式→指标记录）
+- [x] 任务 18：在 main.go 中组装服务 — `cmd/gateway/main.go`（配置加载→嵌入引擎→Redis→Provider 注册表→负载均衡→熔断器→路由策略→语义缓存→Fallback 引擎→ChatService→Prometheus→HTTP 服务→优雅关闭）
 
 ### 实现约束
 
