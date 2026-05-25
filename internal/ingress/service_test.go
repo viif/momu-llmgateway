@@ -12,10 +12,12 @@ import (
 )
 
 type mockProvider struct {
-	name   string
-	models []string
-	resp   *model.StandardResponse
-	err    error
+	name      string
+	models    []string
+	resp      *model.StandardResponse
+	err       error
+	streamCh  chan model.StreamChunk
+	streamErr error
 }
 
 func (m *mockProvider) Name() string     { return m.name }
@@ -24,6 +26,23 @@ func (m *mockProvider) Send(ctx context.Context, req *model.StandardRequest) (*m
 	return m.resp, m.err
 }
 func (m *mockProvider) SendStream(ctx context.Context, req *model.StandardRequest) (<-chan model.StreamChunk, error) {
+	if m.streamErr != nil {
+		return nil, m.streamErr
+	}
+	if m.streamCh != nil {
+		out := make(chan model.StreamChunk)
+		go func() {
+			defer close(out)
+			for chunk := range m.streamCh {
+				select {
+				case out <- chunk:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		return out, nil
+	}
 	ch := make(chan model.StreamChunk)
 	close(ch)
 	return ch, nil
@@ -213,4 +232,106 @@ func TestCircuitBreakerManagerHalfOpenAfterCooldown(t *testing.T) {
 	require.False(t, mgr.Allow("openai", "gpt-4o"))
 	time.Sleep(60 * time.Millisecond)
 	require.True(t, mgr.Allow("openai", "gpt-4o"))
+}
+
+func TestChatServiceStreamingSuccess(t *testing.T) {
+	streamCh := make(chan model.StreamChunk, 3)
+	streamCh <- model.StreamChunk{ID: "s1", Delta: model.Delta{Role: "assistant"}}
+	streamCh <- model.StreamChunk{ID: "s1", Delta: model.Delta{Content: "Hello"}}
+	streamCh <- model.StreamChunk{ID: "s1", Done: true}
+	close(streamCh)
+
+	prov := &mockProvider{name: "openai", streamCh: streamCh}
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o", Strategy: "explicit"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		nil,
+		nil,
+		func(name string) model.Provider { return prov },
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+
+	require.NoError(t, err)
+	var chunks []model.StreamChunk
+	for c := range ch {
+		chunks = append(chunks, c)
+	}
+	require.Len(t, chunks, 3)
+	require.Equal(t, "assistant", chunks[0].Delta.Role)
+	require.Equal(t, "Hello", chunks[1].Delta.Content)
+	require.True(t, chunks[2].Done)
+}
+
+func TestChatServiceStreamingCircuitBreakerOpen(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: false}}},
+		nil,
+		nil,
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+
+	require.Error(t, err)
+	require.Nil(t, ch)
+	me, ok := err.(*model.Error)
+	require.True(t, ok)
+	require.Equal(t, model.ErrCodeCircuitOpen, me.Code)
+}
+
+func TestChatServiceStreamingRouteError(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{err: model.NewError(model.ErrCodeModelNotFound, "no route")},
+		&mockCBManager{},
+		nil,
+		nil,
+		nil,
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "unknown", Messages: []model.Message{{Role: "user", Content: "hi"}}}
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+
+	require.Error(t, err)
+	require.Nil(t, ch)
+}
+
+func TestChatServiceStreamingProviderNotFound(t *testing.T) {
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "nonexistent", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"nonexistent/gpt-4o": {allow: true}}},
+		nil,
+		nil,
+		func(name string) model.Provider { return nil },
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+
+	require.Error(t, err)
+	require.Nil(t, ch)
+	me, ok := err.(*model.Error)
+	require.True(t, ok)
+	require.Equal(t, model.ErrCodeProviderError, me.Code)
+	require.Contains(t, me.Message, "provider not found")
+}
+
+func TestChatServiceStreamingSendStreamError(t *testing.T) {
+	prov := &mockProvider{name: "openai", streamErr: model.NewError(model.ErrCodeProviderError, "timeout")}
+	svc := NewChatService(
+		&mockRouter{decision: decision.RouteDecision{ProviderName: "openai", Model: "gpt-4o"}},
+		&mockCBManager{breakers: map[string]*mockCircuitBreaker{"openai/gpt-4o": {allow: true}}},
+		nil,
+		nil,
+		func(name string) model.Provider { return prov },
+	)
+	ctx := context.Background()
+	req := &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}
+	ch, err := svc.HandleChatCompletionStream(ctx, req)
+
+	require.Error(t, err)
+	require.Nil(t, ch)
 }
