@@ -7343,34 +7343,106 @@ git commit -m "feat: 组装网关服务完整启动流程"
 
 ---
 
-## 任务 19：添加 Dockerfile
+## 任务 19：添加 Dockerfile 和 .dockerignore
+
+**背景：** 本项目依赖 CGO 构建（`internal/embedding/onnx.go` 无条件导入 `github.com/yalue/onnxruntime_go`），运行时需要 ONNX Runtime 共享库和嵌入模型文件，不可使用 `CGO_ENABLED=0`。多阶段构建：builder 拉取 ONNX Runtime 动态库用于 CGO 链接；runtime 安装库文件 + curl（健康检查）+ 模型文件，以非 root 用户运行。
 
 **文件：**
+- 新建： `.dockerignore`
 - 新建： `Dockerfile`
 
-- [ ] **步骤 1：创建多阶段 Dockerfile**
+- [ ] **步骤 1：创建 .dockerignore**
+
+文件： `.dockerignore`
+
+```
+.git
+.github
+*.md
+docs/
+testdata/
+vendor/
+tmp/
+*.log
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
+```
+
+- [ ] **步骤 2：创建多阶段 Dockerfile（含 ONNX 支持、非 root、健康检查）**
 
 文件： `Dockerfile`
 
+> **要点说明：**
+> - Builder 阶段安装 ONNX Runtime 1.21.0 动态库供 CGO 链接，`CGO_ENABLED=1`。
+> - Runtime 阶段复制 ONNX Runtime 库文件、curl（HEALTHCHECK 依赖）、嵌入模型目录。
+> - 使用 `debian:bookworm-slim` 而非 Alpine（ONNX Runtime 官方不提供 musl 构建）。
+> - 创建非 root 用户 `gateway`、设置 `HEALTHCHECK`、`STOPSIGNAL SIGTERM`、OCI 标签。
+> - 嵌入模型文件通过 `COPY --chown=gateway:gateway` 设置属主，确保运行时可读。
+> - `BUILD_TIME` 和 `VERSION` 通过 `ARG` 传入，默认值为 `dev` / 空。
+
 ```dockerfile
-FROM golang:1.21-alpine AS builder
-RUN apk add --no-cache git ca-certificates
+# ── Builder Stage ──
+FROM golang:1.25-bookworm AS builder
+
+ARG ONNX_VERSION=1.21.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    curl -sL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNX_VERSION}/onnxruntime-linux-x64-${ONNX_VERSION}.tgz" -o onnxruntime.tgz && \
+    tar xzf onnxruntime.tgz && \
+    cp onnxruntime-linux-x64-${ONNX_VERSION}/lib/libonnxruntime.so* /usr/local/lib/ && \
+    rm -rf onnxruntime*
+
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /gateway ./cmd/gateway
 
-FROM alpine:3.19
-RUN apk add --no-cache ca-certificates tzdata
+ARG VERSION=dev
+ARG BUILD_TIME
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.buildTime=${BUILD_TIME}" \
+    -o /gateway ./cmd/gateway
+
+# ── Runtime Stage ──
+FROM debian:bookworm-slim
+
+ARG VERSION=dev
+ARG BUILD_TIME
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata curl && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/libonnxruntime.so* /usr/local/lib/
+RUN ldconfig
+
+RUN groupadd -r gateway && useradd -r -g gateway -d /app -s /sbin/nologin gateway
 WORKDIR /app
+
 COPY --from=builder /gateway /app/gateway
 COPY configs/gateway.yaml /app/configs/gateway.yaml
+COPY --chown=gateway:gateway .models/ /app/.models/
+
+ENV GATEWAY_CONFIG=/app/configs/gateway.yaml
+
+LABEL org.opencontainers.image.title="momu-llmgateway" \
+      org.opencontainers.image.description="LLM Gateway with multi-provider routing" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.source="https://github.com/viif/momu-llmgateway"
+
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+STOPSIGNAL SIGTERM
+USER gateway
 ENTRYPOINT ["/app/gateway"]
 ```
 
-- [ ] **步骤 2：验证 Dockerfile 构建语法**
+- [ ] **步骤 3：验证构建**
 
 ```bash
 docker build -t momu-llmgateway:local .
@@ -7378,11 +7450,17 @@ docker build -t momu-llmgateway:local .
 
 预期：镜像构建成功。
 
-- [ ] **步骤 3：提交**
+> **注意：** 如本地缺少 `.models/` 目录（含 `tokenizer_config.json`、`tokenizer.json`、`model.onnx`），可先创建占位目录或跳过模型 COPY。占位做法：
+> ```bash
+> mkdir -p .models && touch .models/.gitkeep
+> ```
+> 运行时若启动后 embedding 初始化失败（日志 Warn），语义缓存和语义路由将自动降级，不影响核心聊天补全能力。
+
+- [ ] **步骤 4：提交**
 
 ```bash
-git add Dockerfile
-git commit -m "feat: 添加网关 dockerfile"
+git add Dockerfile .dockerignore
+git commit -m "feat: 添加 dockerfile 和 .dockerignore"
 ```
 
 ---
