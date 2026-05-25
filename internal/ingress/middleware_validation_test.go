@@ -114,3 +114,61 @@ func TestValidationSkipsNonChatPath(t *testing.T) {
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
 	require.Equal(t, http.StatusOK, w.Code)
 }
+
+func TestValidationAcceptsTemperatureBoundary(t *testing.T) {
+	for _, temp := range []float64{0, 2} {
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		r.Use(ValidationMiddleware(testModels))
+		r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		body, _ := json.Marshal(map[string]any{
+			"model":       "gpt-4o",
+			"messages":    []map[string]string{{"role": "user", "content": "hi"}},
+			"temperature": temp,
+		})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+		require.Equal(t, http.StatusOK, w.Code)
+	}
+}
+
+func TestValidationRejectsEmptyRole(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "", "content": "hi"}},
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "role")
+}
+
+func TestValidationRejectsMalformedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("not json"))))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestValidationRejectsMissingMessages(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ValidationMiddleware(testModels))
+	r.POST("/v1/chat/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	body, _ := json.Marshal(map[string]any{"model": "gpt-4o"})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	require.Contains(t, w.Body.String(), "messages")
+}
