@@ -13,17 +13,18 @@ import (
 )
 
 type Anthropic struct {
+	name    string
 	baseURL string
 	apiKey  string
 	models  []string
 	client  *http.Client
 }
 
-func NewAnthropic(baseURL, apiKey string, models []string, timeout time.Duration) *Anthropic {
-	return &Anthropic{baseURL: baseURL, apiKey: apiKey, models: models, client: &http.Client{Timeout: timeout}}
+func NewAnthropic(name, baseURL, apiKey string, models []string, timeout time.Duration) *Anthropic {
+	return &Anthropic{name: name, baseURL: baseURL, apiKey: apiKey, models: models, client: &http.Client{Timeout: timeout}}
 }
 
-func (p *Anthropic) Name() string { return "anthropic" }
+func (p *Anthropic) Name() string { return p.name }
 
 func (p *Anthropic) Models() []string { return p.models }
 

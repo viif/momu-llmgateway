@@ -51,13 +51,16 @@ func main() {
 	}
 
 	// ── 4. Redis ─────────────────────────────────────────────
-	redisClient := redis.NewClient(&redis.Options{
+	var redisClient *redis.Client
+	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Redis.Addr,
 		Password: cfg.Redis.Password,
 		DB:       cfg.Redis.DB,
 	})
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
-		log.Fatal("redis connect", zap.Error(err))
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Warn("redis unavailable, rate limit disabled", zap.Error(err))
+	} else {
+		redisClient = rdb
 	}
 
 	// ── 5. Provider 注册表 ──────────────────────────────────
@@ -66,7 +69,7 @@ func main() {
 		var p model.Provider
 		switch pc.Type {
 		case "anthropic":
-			p = egress.NewAnthropic(pc.BaseURL, pc.APIKey, pc.Models, pc.Timeout)
+			p = egress.NewAnthropic(name, pc.BaseURL, pc.APIKey, pc.Models, pc.Timeout)
 		default:
 			p = egress.NewOpenAICompatible(name, pc.BaseURL, pc.APIKey, pc.Models, pc.Timeout)
 		}

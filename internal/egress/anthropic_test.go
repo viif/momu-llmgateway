@@ -9,7 +9,7 @@ import (
 )
 
 func TestAnthropicExtractsSystemMessage(t *testing.T) {
-	p := NewAnthropic("https://example.test", "sk", []string{"claude-sonnet-4-20250514"}, time.Second)
+	p := NewAnthropic("test-anthropic", "https://example.test", "sk", []string{"claude-sonnet-4-20250514"}, time.Second)
 	body, err := p.buildRequestBody(&model.StandardRequest{Model: "claude-sonnet-4-20250514", Messages: []model.Message{{Role: "system", Content: "be brief"}, {Role: "user", Content: "hi"}}})
 	require.NoError(t, err)
 	require.Contains(t, string(body), "system")
