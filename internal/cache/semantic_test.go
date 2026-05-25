@@ -241,7 +241,7 @@ func TestLoadFromStoreRecoversEntries(t *testing.T) {
 	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour}, embedder, store)
 
 	respJSON, _ := json.Marshal(&model.StandardResponse{ID: "recovered", Model: "gpt-4o"})
-	store.Save(context.Background(), "gpt-4o", "k1", []float64{1.0, 0.0}, respJSON, time.Hour)
+	require.NoError(t, store.Save(context.Background(), "gpt-4o", "k1", []float64{1.0, 0.0}, respJSON, time.Hour))
 
 	c.SetModels([]string{"gpt-4o"})
 	require.NoError(t, c.LoadFromStore(context.Background()))
@@ -271,9 +271,10 @@ func TestEncodeDecodeVector(t *testing.T) {
 func TestCacheConcurrentAccess(t *testing.T) {
 	embedder := &fakeEmbedder{vectors: map[string][]float64{"hi": {1.0, 0.0}}}
 	c := New(SemanticCacheConfig{Enabled: true, MaxEntries: 100, SimilarityThreshold: 0.8, TTL: time.Hour}, embedder, nil)
-	c.Store(context.Background(), &model.StandardRequest{
+	err := c.Store(context.Background(), &model.StandardRequest{
 		Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}},
 	}, &model.StandardResponse{ID: "resp"})
+	require.NoError(t, err)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
@@ -287,7 +288,7 @@ func TestCacheConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c.Store(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}, &model.StandardResponse{ID: "concurrent"})
+			_ = c.Store(context.Background(), &model.StandardRequest{Model: "gpt-4o", Messages: []model.Message{{Role: "user", Content: "hi"}}}, &model.StandardResponse{ID: "concurrent"})
 		}()
 	}
 	wg.Wait()
