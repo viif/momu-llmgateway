@@ -124,7 +124,7 @@ func TestOpenAICompatibleSendStreamSuccess(t *testing.T) {
 			`data: [DONE]`,
 		}
 		for _, c := range chunks {
-			w.Write([]byte(c + "\n\n"))
+			_, _ = w.Write([]byte(c + "\n\n"))
 			flusher.Flush()
 		}
 	}))
