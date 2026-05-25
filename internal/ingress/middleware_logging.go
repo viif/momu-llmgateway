@@ -4,8 +4,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"go.uber.org/zap"
 	"github.com/viif/momu-llmgateway/internal/observability"
+	"go.uber.org/zap"
 )
 
 func LoggingMiddleware() gin.HandlerFunc {
