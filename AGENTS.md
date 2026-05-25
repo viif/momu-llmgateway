@@ -4,8 +4,8 @@
 
 仓库已进入实现阶段。设计文档和分步实施计划：
 
-- `docs/superpowers/specs/llm-gateway-design.md` — 产品与架构设计文档
-- `docs/superpowers/plans/llm-gateway.md` — 分任务实施计划（20 个任务、按 TDD 逐项实施）
+- `docs/superpowers/specs/2026-05-20-llm-gateway-design.md` — 产品与架构设计文档
+- `docs/superpowers/plans/2026-05-20-llm-gateway.md` — 分任务实施计划（20 个任务、按 TDD 逐项实施）
 
 ### 实施进度
 
