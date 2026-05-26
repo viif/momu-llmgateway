@@ -72,6 +72,7 @@ type RoutingRuleConfig struct {
 
 type SemanticRoutingConfig struct {
 	SimilarityThreshold float64                  `mapstructure:"similarity_threshold"`
+	MaxPromptLength     int                      `mapstructure:"max_prompt_length"`
 	Categories          []SemanticCategoryConfig `mapstructure:"categories"`
 }
 

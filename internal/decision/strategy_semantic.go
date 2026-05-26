@@ -17,13 +17,14 @@ type CategoryPrototype struct {
 }
 
 type SemanticRouter struct {
-	categories []CategoryPrototype
-	threshold  float64
-	engine     Embedder
+	categories      []CategoryPrototype
+	threshold       float64
+	maxPromptLength int
+	engine          Embedder
 }
 
 func NewSemanticRouter(cfg config.SemanticRoutingConfig, eng Embedder) (*SemanticRouter, error) {
-	sr := &SemanticRouter{threshold: cfg.SimilarityThreshold, engine: eng}
+	sr := &SemanticRouter{threshold: cfg.SimilarityThreshold, maxPromptLength: cfg.MaxPromptLength, engine: eng}
 	if eng == nil || len(cfg.Categories) == 0 {
 		return sr, nil
 	}
@@ -65,6 +66,10 @@ func (sr *SemanticRouter) Route(req *model.StandardRequest) (models []string, ca
 
 	text := concatenateUserMessages(req.Messages)
 	if text == "" {
+		return nil, "", 0
+	}
+
+	if sr.maxPromptLength > 0 && len([]rune(text)) > sr.maxPromptLength {
 		return nil, "", 0
 	}
 

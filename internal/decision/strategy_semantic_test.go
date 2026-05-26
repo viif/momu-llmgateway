@@ -102,6 +102,76 @@ func TestSemanticRouteEmptyMessages(t *testing.T) {
 	require.Nil(t, models)
 }
 
+func TestSemanticRouteSkipLongPrompt(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1": {1.0, 0.0},
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		MaxPromptLength:     3,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
+	require.NoError(t, err)
+
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "hello world"}},
+	})
+	require.Nil(t, models)
+}
+
+func TestSemanticRoutePromptWithinLimit(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1": {1.0, 0.0},
+			"hi":    {0.9, 0.1},
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		MaxPromptLength:     5,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
+	require.NoError(t, err)
+
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "hi"}},
+	})
+	require.NotNil(t, models)
+	require.Equal(t, []string{"deepseek-chat"}, models)
+}
+
+func TestSemanticRouteMaxPromptLengthZero(t *testing.T) {
+	fake := &fakeEmbedder{
+		vectors: map[string][]float64{
+			"code1": {1.0, 0.0},
+			"hi":    {0.9, 0.1},
+		},
+	}
+	cfg := config.SemanticRoutingConfig{
+		SimilarityThreshold: 0.75,
+		MaxPromptLength:     0,
+		Categories: []config.SemanticCategoryConfig{
+			{Name: "code", TargetModels: []string{"deepseek-chat"}, Exemplars: []string{"code1"}},
+		},
+	}
+	sr, err := NewSemanticRouter(cfg, fake)
+	require.NoError(t, err)
+
+	models, _, _ := sr.Route(&model.StandardRequest{
+		Messages: []model.Message{{Role: "user", Content: "hi"}},
+	})
+	require.NotNil(t, models)
+	require.Equal(t, []string{"deepseek-chat"}, models)
+}
+
 func TestSemanticRouteNoEngine(t *testing.T) {
 	cfg := config.SemanticRoutingConfig{
 		SimilarityThreshold: 0.75,

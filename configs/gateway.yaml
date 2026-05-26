@@ -67,6 +67,7 @@ routing:
     deepseek-reasoner: ["deepseek-chat", "gpt-4o-mini"]
 semantic_routing:
   similarity_threshold: 0.75
+  max_prompt_length: 1024
   categories:
     - name: "code_generation"
       target_models: ["deepseek-chat", "gpt-4o"]
