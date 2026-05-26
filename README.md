@@ -252,21 +252,13 @@ semantic_routing:
     - name: "code_generation"
       target_models: ["deepseek-chat", "gpt-4o"]
       exemplars:
-        - "Write a Python function that..."
-        - "用 Go 实现一个并发安全的缓存"
-        - ...
-    - name: "creative_writing"
-      target_models: ["claude-sonnet-4-20250514", "gpt-4o"]
-      exemplars:
-        - "Write a story about a robot learning to paint"
-        - "写一篇关于春天的散文"
-        - ...
+        - "Generate code to implement..."
+        - "生成代码以实现..."
     - name: "data_analysis"
       target_models: ["gpt-4o", "deepseek-chat"]
       exemplars:
         - "Analyze this dataset and find trends"
-        - "分析这些日志中的错误分布"
-        - ...
+        - "分析这个数据集并找出趋势"
 ```
 
 | 字段 | 说明 |
